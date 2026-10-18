@@ -5,7 +5,7 @@
 function Initialize-Core {
     Set-StrictMode -Off
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $script:AppVersion = '1.3.1'
+    $script:AppVersion = '1.3.2'
     $script:RepoSlug = 'Adenoidcash/episode-renamer'
     $script:VideoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.ts', '.m2ts', '.webm', '.flv', '.mpg', '.mpeg')
     $script:SubExt = @('.srt', '.ass', '.ssa', '.sub', '.idx', '.vtt', '.sup')
@@ -21,7 +21,7 @@ function Initialize-Core {
     $script:TvdbToken = $null
     $script:LastTvmazeCall = [DateTime]::MinValue
     $script:LangCodes = 'en|eng|es|spa|fr|fre|fra|de|ger|deu|it|ita|pt|por|ja|jpn|ko|kor|zh|chi|zho|ru|rus|nl|dut|nld|sv|swe|no|nor|nb|da|dan|fi|fin|pl|pol|ar|ara|he|heb|tr|tur|hi|hin|cs|cze|ces|hu|hun|el|gre|ell|th|tha|vi|vie|id|ind|ro|rum|ron|uk|ukr'
-    $script:JunkPattern = '(?i)\s*(?:[\[\(\{].*|\b(?:480p|576p|720p|1080p|2160p|4K|UHD|HDR|WEB(?:-?DL|-?Rip)?|BluRay|BDRip|BRRip|HDTV|DVDRip|x264|x265|H\s?26[45]|HEVC|AVC|AAC(?:\d(?:\s\d)?)?|DDP?(?:\d(?:\s\d)?)?|AC3|FLAC|Opus|10bit|8bit|NF|AMZN|CR|DSNP|HMAX|REPACK|PROPER|iNTERNAL|MULTi|DUAL|EXTENDED|UNRATED|REMASTERED|IMAX)\b.*)$'
+    $script:JunkPattern = '(?i)\s*(?:[\[\(\{].*|\b(?:480p|576p|720p|1080p|2160p|4K|UHD|HDR|WEB(?:-?DL|-?Rip)?|BluRay|BDRip|BRRip|HDTV|DVDRip|x264|x265|H\s?26[45]|HEVC|AVC|AAC(?:\d(?:\s\d)?)?|DDP?(?:\d(?:\s\d)?)?|AC3|FLAC|Opus|10bit|8bit|NF|AMZN|CR|DSNP|HMAX|REPACK|PROPER|iNTERNAL|MULTi|MULTiSUBS|DUAL|DUALAUDIO|EXTENDED|UNRATED|REMASTERED|IMAX|HDR10|DoVi|Atmos|ITALIAN|FRENCH|TRUEFRENCH|VOSTFR|VFF|GERMAN|SPANISH|LATINO|CASTELLANO|JAPANESE|KOREAN|HINDI|RUSSIAN|DUBBED|SUBBED)\b.*)$'
 }
 Initialize-Core
 
@@ -297,6 +297,19 @@ function Complete-AbsoluteNumbers($Episodes) {
 
 # ---------------------------------------------------------------- filename parsing
 
+# "www.UIndex.org - Fallout.2024.S02E04..." -> "Fallout.2024.S02E04..."
+function Remove-SitePrefix([string]$Name) {
+    $Name -replace '^(?i)\s*(?:www\.)?[a-z0-9-]+\.(?:org|com|net|to|cc|io|tv|me|info|xyz|ws|in|co|nu|se|ru|lol|club|site|top|biz|eu|uk)\s*[-:]\s*', ''
+}
+
+# Underscores, and dots that join words ("Fallout.2024.S02E04"), become spaces. Dots before a space or
+# next to another dot are real punctuation and stay ("Luffy vs. Zoro", "Cat's in the Bag...").
+function ConvertTo-SpacedName([string]$Name) {
+    $s = $Name -replace '_+', ' '
+    $s = $s -replace '(?<![.\s])\.(?=[^\s.])', ' '
+    ($s -replace '\s{2,}', ' ').Trim()
+}
+
 function ConvertFrom-EpisodeFileName([string]$FileName) {
     $ext = [IO.Path]::GetExtension($FileName)
     $base = [IO.Path]::GetFileNameWithoutExtension($FileName)
@@ -311,9 +324,9 @@ function ConvertFrom-EpisodeFileName([string]$FileName) {
     # Drop leading [Group] / (tag) blocks. Underscores are always separators; dots only when the
     # name has no real spaces (scene style "Show.S01E01.Title"), so titles like "Men!." or "vs." survive.
     $s = $base
+    $s = Remove-SitePrefix $s
     while ($s -match '^\s*(\[[^\]]*\]|\([^)]*\)|\{[^}]*\})\s*') { $s = $s.Substring($matches[0].Length) }
-    $s = $s -replace '_+', ' '
-    if (([regex]::Matches($s, ' ')).Count -lt 2) { $s = $s -replace '\.+', ' ' }
+    $s = ConvertTo-SpacedName $s
     $s = ($s -replace '\s{2,}', ' ').Trim()
 
     $result = [pscustomobject]@{
@@ -377,7 +390,8 @@ function ConvertFrom-EpisodeFileName([string]$FileName) {
         # Whatever follows the episode number, minus release junk, is the title.
         $rest = $s.Substring($m.Index + $m.Length)
         $rest = [regex]::Replace($rest, $script:JunkPattern, '')
-        $result.Title = ($rest -replace '^[\s\-:~|]+', '').Trim()
+        $t = (($rest -replace '^[\s\-:~|.]+', '') -replace '[\s\-:~|]+$', '').Trim()
+        $result.Title = if ($t -match '[\p{L}\p{N}]') { $t } else { '' }   # "." or "-" alone isn't a title
     }
     $result
 }
@@ -532,6 +546,8 @@ function Resolve-EpisodeInfo($Found, $Parsed, $FolderSeason, [string]$Numbering,
     $yearSeasons = @($found | Where-Object { $_.Season -ge 1900 }).Count -gt 0
     $useFile = ($Numbering -eq 'File') -or ($Numbering -eq 'Auto' -and $yearSeasons -and $null -ne $fileSeason)
     $title = if ($TitleMode -eq 'File' -and $Parsed.Title) { $Parsed.Title } else { $null }
+    # Keep the filename's title only if it looks like this episode's title - not a leftover tag ("iTALiAN").
+    if ($title -and -not @($found | Where-Object { Test-TitleResembles $title $_.Title }).Count) { $title = $null }
     for ($i = 0; $i -lt $found.Count; $i++) {
         $e = $found[$i]
         $fileNumber = if ($Parsed.Kind -ne 'None') { $Parsed.Episodes[[Math]::Min($i, $Parsed.Episodes.Count - 1)] } else { $null }
@@ -539,15 +555,29 @@ function Resolve-EpisodeInfo($Found, $Parsed, $FolderSeason, [string]$Numbering,
         $season = if ($useFile -and $null -ne $fileSeason) { $fileSeason } else { $e.Season }
         # A placeholder number (TVmaze special) never goes into a name: keep the file's own, or flag it.
         if ($e.NumberGuessed) { $number = if ($Parsed.Kind -eq 'SE') { $fileNumber } else { $null }; $season = 0 }
+        $useTitle = if ($title) { $title } else { $e.Title }
+        # Same words as the official title, just different punctuation: use the official spelling.
+        if ($title -and $e.Title -and ((Get-TitleWords $title) -join ' ') -eq ((Get-TitleWords $e.Title) -join ' ')) { $useTitle = $e.Title }
         [pscustomobject]@{
             Season      = $season
             Number      = $number
             Absolute    = $e.Absolute
-            Title       = if ($title) { $title } else { $e.Title }
+            Title       = $useTitle
             AirDate     = $e.AirDate
             NeedsNumber = ($null -eq $number)
         }
     }
+}
+
+# Does a title from a filename plausibly name this episode? Releases word titles differently
+# ("A Town that Welcomes Pirates..." vs "A Pirate-Loving Town..."), so one shared meaningful word is enough.
+function Test-TitleResembles([string]$FileTitle, [string]$SourceTitle) {
+    if (-not $SourceTitle) { return $true }
+    $stop = @('the', 'a', 'an', 'and', 'of', 'to', 'in', 'on', 'at', 'for', 'is', 'part', 'episode')
+    $f = @(Get-TitleWords $FileTitle | Where-Object { $stop -notcontains $_ })
+    $s = @(Get-TitleWords $SourceTitle | Where-Object { $stop -notcontains $_ })
+    if ($f.Count -eq 0 -or $s.Count -eq 0) { $f = @(Get-TitleWords $FileTitle); $s = @(Get-TitleWords $SourceTitle) }
+    @($f | Where-Object { $s -contains $_ }).Count -gt 0
 }
 
 # Status text for a file whose special was found but can't be numbered from this source.
@@ -746,9 +776,9 @@ function Get-ErrorText($ErrorRecord) { ($ErrorRecord.Exception.Message -split "`
 # "One.Piece.(1999)" / "[Group] Inception.2010.1080p.BluRay" -> Title "One Piece" / "Inception", Year 1999 / 2010.
 function ConvertFrom-FolderTitle([string]$Name) {
     $s = $Name
+    $s = Remove-SitePrefix $s
     while ($s -match '^\s*(\[[^\]]*\]|\{[^}]*\})\s*') { $s = $s.Substring($matches[0].Length) }
-    $s = $s -replace '_+', ' '
-    if (([regex]::Matches($s, ' ')).Count -lt 2) { $s = $s -replace '\.+', ' ' }
+    $s = ConvertTo-SpacedName $s
     # The year is the last plausible 19xx/20xx that isn't the very start ("2001 A Space Odyssey 1968",
     # "Blade Runner 2049 (2017)" -> 1968 / 2017).
     $pick = $null
