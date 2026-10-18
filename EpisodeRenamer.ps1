@@ -25,6 +25,7 @@ $script:AfterFetch = $null
 $script:YearHint = $null
 $script:UpdateUrl = $null
 $script:LibTabs = @{}
+$script:Closing = $false
 
 $MatchModes = [ordered]@{ 'Auto' = 'Auto'; 'Season + Episode' = 'SeasonEpisode'; 'Absolute number' = 'Absolute' }
 $NumberingModes = [ordered]@{ 'Auto' = 'Auto'; 'From source' = 'Source'; 'From file / folder' = 'File' }
@@ -349,6 +350,8 @@ function Start-Background([string]$Status, [scriptblock]$Work, [hashtable]$Param
 }
 
 $jobTimer.Add_Tick({
+        # Results that arrive after the window closed have nowhere to go.
+        if ($form.IsDisposed -or $script:Closing) { $jobTimer.Stop(); return }
         if ((Test-Busy) -and $script:Sync.Status -and $lblStatus.Text -ne $script:Sync.Status) { $lblStatus.Text = $script:Sync.Status }
         foreach ($j in @($script:Jobs | Where-Object { $_.Handle.IsCompleted })) {
             $script:Jobs.Remove($j)
@@ -462,12 +465,26 @@ function Invoke-Search {
     $q = $txtSearch.Text.Trim()
     if (-not $q) { throw 'Type a show name to search for.' }
     $src = [string]$cboSource.SelectedItem
-    $params = @{ Source = $src; Query = $q; Lang = $txtLang.Text.Trim(); Key = $settings.TvdbApiKey; Pin = $settings.TvdbPin; Token = $script:TvdbToken }
+    $params = @{ Query = $q; Ctx = (Get-LookupContext); Token = $script:TvdbToken; YearHint = $script:YearHint
+        Parsed = @($grid.Rows | ForEach-Object { $_.Tag.Parsed } | Where-Object { $_.Kind -ne 'None' }) }
     [void](Start-Background "Searching $src for '$q'..." {
-            param($Source, $Query, $Lang, $Key, $Pin, $Token)
+            param($Query, $Ctx, $Token, $YearHint, $Parsed)
             $script:TvdbToken = $Token
-            if ($Source -eq 'TheTVDB') { Connect-Tvdb $Key $Pin; $r = @(Search-Tvdb $Query $Lang) } else { $r = @(Search-TVmaze $Query) }
-            @{ Results = $r; Query = $Query; Token = $script:TvdbToken }
+            $r = @(Find-Shows $Query $Ctx)
+            # Several shows with exactly this name and no year to go on (anime vs live-action One Piece):
+            # pick the one whose episode list contains the most of the files, like the TV Library tab does.
+            $pick = -1
+            $episodes = $null
+            $sameName = @($r | Where-Object { $_.Name -eq $Query } | Select-Object -First 4)
+            if (-not ($YearHint -and @($r | Where-Object { "$($_.Year)" -eq "$YearHint" }).Count) -and $sameName.Count -gt 1 -and $Parsed.Count) {
+                $best = -1
+                foreach ($cand in $sameName) {
+                    $eps = Get-ShowEpisodes $cand $Ctx
+                    $score = @($Parsed | Where-Object { @(Find-Episodes $_ $eps $Ctx.Match).Count -gt 0 }).Count
+                    if ($score -gt $best) { $best = $score; $pick = [array]::IndexOf($r, $cand); $episodes = $eps }
+                }
+            }
+            @{ Results = $r; Query = $Query; Token = $script:TvdbToken; Pick = $pick; Episodes = $episodes }
         } $params { param($o) Complete-Search $o })
 }
 
@@ -484,7 +501,14 @@ function Complete-Search($o) {
         for ($i = 0; $i -lt $script:SearchResults.Count; $i++) { if ("$($script:SearchResults[$i].Year)" -eq "$script:YearHint") { $idx = $i; break } }
     }
     $picked = ($script:YearHint -and "$($script:SearchResults[$idx].Year)" -eq "$script:YearHint")
-    # Without a year match, open the list once the episodes have loaded so the user checks the pick.
+    if (-not $picked -and $o.Pick -ge 0) {
+        # Chosen by which show's episode list matched the files; its episodes are already downloaded.
+        $idx = $o.Pick
+        $picked = $true
+        $show = $script:SearchResults[$idx]
+        $script:EpisodeCache["$($show.Source)|$($show.Id)|$($cboOrder.SelectedItem)|$($txtLang.Text.Trim())"] = @($o.Episodes)
+    }
+    # Without a confident pick, open the list once the episodes have loaded so the user checks it.
     $script:PromptPick = (-not $picked -and $script:SearchResults.Count -gt 1)
     $cboResults.SelectedIndex = $idx
 }
@@ -961,7 +985,11 @@ $form.Add_FormClosing({
         $settings.MovieRoot = $script:LibTabs['Movie'].Txt.Text.Trim()
         $settings.MovieFolders = $script:LibTabs['Movie'].MovieFolders.Checked
         try { Save-Settings $settings } catch { }
-        foreach ($j in @($script:Jobs)) { try { $j.PS.Stop(); $j.PS.Dispose() } catch { } }
+        # Don't wait for running lookups (PowerShell.Stop() blocks until a web request returns); ask them
+        # to stop and let the process exit below.
+        $script:Closing = $true
+        $jobTimer.Stop()
+        foreach ($j in @($script:Jobs)) { try { [void]$j.PS.BeginStop($null, $null) } catch { } }
     })
 
 # ---------------------------------------------------------------- start
@@ -983,3 +1011,5 @@ $script:Loading = $false
 Set-Status 'Pick a folder (or drag one in) to get started.'
 
 [void]$form.ShowDialog()
+# A lookup still running in the background would keep the process alive after the window is gone.
+if (@($script:Jobs | Where-Object { -not $_.Handle.IsCompleted }).Count) { [Environment]::Exit(0) }
