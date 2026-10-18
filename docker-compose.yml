@@ -1,0 +1,16 @@
+# docker compose up -d   then open http://<server>:8080
+services:
+  episode-renamer:
+    image: ghcr.io/adenoidcash/episode-renamer:latest
+    container_name: episode-renamer
+    ports:
+      - "8080:8080"
+    volumes:
+      - /path/to/media:/media              # your TV and Movies folders live under here
+      - ./config:/config                   # settings + undo history
+    environment:
+      - PUID=1000                          # owner for renamed files/folders (Unraid: 99)
+      - PGID=1000                          # group (Unraid: 100)
+      - UMASK=002
+      # - WEB_PASSWORD=change-me           # optional: ask for a password in the browser
+    restart: unless-stopped

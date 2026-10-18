@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Episode Renamer</title>
+  <link rel="icon" href="icon.png">
+  <link rel="stylesheet" href="style.css">
+  <script>
+    // Apply the saved theme before first paint so there's no light flash in dark mode.
+    try { const t = localStorage.getItem('theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+  </script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="icon.png" alt="" width="28" height="28">
+      <span class="name">Episode Renamer</span>
+      <span class="version" id="version"></span>
+    </div>
+    <div class="top-actions">
+      <button class="ghost" id="themeBtn" title="Switch between automatic, light and dark theme"></button>
+      <button class="ghost" id="settingsBtn">Settings</button>
+    </div>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button role="tab" class="tab active" data-kind="TV">TV Library</button>
+    <button role="tab" class="tab" data-kind="Movie">Movies</button>
+  </nav>
+
+  <main>
+    <section class="panel">
+      <div class="folder-row">
+        <label for="folder" class="folder-label">Folder</label>
+        <input id="folder" type="text" spellcheck="false" autocomplete="off" placeholder="/media/TV">
+        <button id="browseBtn">Browse…</button>
+        <button id="analyzeBtn" class="primary">Analyze</button>
+      </div>
+      <p class="hint" id="hint"></p>
+
+      <div class="toolbar" id="toolbar" hidden>
+        <button id="renameBtn" class="primary">Rename checked</button>
+        <button id="checkAllBtn">Check all</button>
+        <button id="checkNoneBtn">Check none</button>
+        <label class="toggle"><input type="checkbox" id="detailsChk" checked> Show file details</label>
+        <label class="toggle" id="movieFoldersWrap" hidden><input type="checkbox" id="movieFoldersChk"> Put loose movies in their own folder</label>
+        <span class="summary" id="summary"></span>
+      </div>
+
+      <div class="table-wrap">
+        <table id="results" hidden>
+          <thead>
+            <tr><th class="col-use"></th><th>Current name</th><th>New name</th><th class="col-match">Matched as</th><th class="col-status">Status</th><th class="col-act"></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="empty" id="empty">Pick a folder and click <b>Analyze</b>. Nothing changes until you click <b>Rename checked</b>.</div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="statusbar">
+    <button id="undoBtn">Undo last rename</button>
+    <span class="spinner" id="spinner" hidden></span>
+    <span id="status"></span>
+  </footer>
+
+  <!-- Folder browser -->
+  <dialog id="browseDlg">
+    <form method="dialog" class="dlg">
+      <h2>Choose a folder</h2>
+      <div class="crumb" id="browsePath"></div>
+      <ul class="dir-list" id="dirList"></ul>
+      <div class="dlg-actions">
+        <button value="cancel">Cancel</button>
+        <button id="useFolderBtn" class="primary" value="use">Use this folder</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Change match -->
+  <dialog id="matchDlg">
+    <form method="dialog" class="dlg wide" id="matchForm">
+      <h2 id="matchTitle">Change match</h2>
+      <div class="search-row">
+        <label>Title <input id="matchQuery" type="text" autocomplete="off"></label>
+        <label class="year">Year <input id="matchYear" type="text" inputmode="numeric" maxlength="4" autocomplete="off"></label>
+        <button id="matchSearchBtn" type="button">Search</button>
+      </div>
+      <ul class="match-list" id="matchList"></ul>
+      <p class="dlg-note" id="matchNote"></p>
+      <div class="dlg-actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button id="matchTypedBtn" type="button">Use title and year as typed</button>
+        <button id="matchUseBtn" class="primary" type="button">Use selected</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Settings -->
+  <dialog id="settingsDlg">
+    <form method="dialog" class="dlg wide" id="settingsForm">
+      <h2>Settings</h2>
+      <fieldset>
+        <legend>TV lookups</legend>
+        <div class="grid2">
+          <label>Source
+            <select name="Source"><option>TVmaze</option><option>TheTVDB</option><option>Sonarr</option></select>
+          </label>
+          <label>Episode order
+            <select name="Order"><option>Aired</option><option>DVD</option><option>Absolute</option></select>
+          </label>
+          <label>Match files by
+            <select name="MatchMode"><option value="Auto">Auto</option><option value="SeasonEpisode">Season + Episode</option><option value="Absolute">Absolute number</option></select>
+          </label>
+          <label>Numbering
+            <select name="Numbering"><option value="Auto">Auto</option><option value="Source">From source</option><option value="File">From file / folder</option></select>
+          </label>
+          <label>Titles
+            <select name="TitleMode"><option value="File">Keep filename title</option><option value="Source">From source</option></select>
+          </label>
+          <label>Language (TheTVDB)
+            <input name="Language" type="text" maxlength="3">
+          </label>
+        </div>
+        <label>Episode name scheme
+          <input name="Scheme" type="text" spellcheck="false">
+        </label>
+        <p class="dlg-note">Tokens: {show} {season:00} {episode:00} {title} {absolute:000} {year} {airdate}</p>
+        <label class="toggle"><input type="checkbox" name="RenameExtras"> Rename matching extras (.nfo, -thumb.jpg, .srt)</label>
+      </fieldset>
+      <fieldset>
+        <legend>API keys (all optional)</legend>
+        <label>TheTVDB API key <input name="TvdbApiKey" type="password" autocomplete="off"></label>
+        <label>TheTVDB subscriber PIN <input name="TvdbPin" type="password" autocomplete="off"></label>
+        <label>TMDB API key (movies) <input name="TmdbKey" type="password" autocomplete="off"></label>
+        <p class="dlg-note">TVmaze needs no key. Movies work without one; titles and years come from the file names.
+          Keys: <a href="https://thetvdb.com/api-information" target="_blank" rel="noopener">TheTVDB</a> ·
+          <a href="https://www.themoviedb.org/settings/api" target="_blank" rel="noopener">TMDB</a></p>
+      </fieldset>
+      <fieldset>
+        <legend>Media apps (optional)</legend>
+        <p class="dlg-note">When connected, renamed folders are updated in Sonarr/Radarr and rescanned, so they don't show episodes or movies as missing.
+          Pick "Sonarr" as the TV source to number episodes exactly the way Sonarr does.</p>
+        <div class="app-grid">
+          <span>Sonarr</span><input name="SonarrUrl" type="text" placeholder="http://192.168.1.10:8989" autocomplete="off"><input name="SonarrKey" type="password" placeholder="API key" autocomplete="off"><button type="button" class="small" data-test="Sonarr">Test</button>
+          <span>Radarr</span><input name="RadarrUrl" type="text" placeholder="http://192.168.1.10:7878" autocomplete="off"><input name="RadarrKey" type="password" placeholder="API key" autocomplete="off"><button type="button" class="small" data-test="Radarr">Test</button>
+          <span>Plex</span><input name="PlexUrl" type="text" placeholder="http://192.168.1.10:32400" autocomplete="off"><input name="PlexToken" type="password" placeholder="token" autocomplete="off"><button type="button" class="small" data-test="Plex">Test</button>
+          <span>Jellyfin</span><input name="JellyfinUrl" type="text" placeholder="http://192.168.1.10:8096" autocomplete="off"><input name="JellyfinKey" type="password" placeholder="API key" autocomplete="off"><button type="button" class="small" data-test="Jellyfin">Test</button>
+        </div>
+        <p class="dlg-note" id="testResult"></p>
+        <label class="toggle"><input type="checkbox" name="ArrSync"> After renaming, update Sonarr/Radarr and refresh Plex/Jellyfin</label>
+      </fieldset>
+      <p class="dlg-note">TV information from <a href="https://www.tvmaze.com" target="_blank" rel="noopener">TVmaze</a> and
+        <a href="https://thetvdb.com" target="_blank" rel="noopener">TheTVDB</a>; movie information from
+        <a href="https://www.themoviedb.org" target="_blank" rel="noopener">TMDB</a>. Not endorsed or certified by TheTVDB or TMDB.</p>
+      <div class="dlg-actions">
+        <button value="cancel" formnovalidate>Cancel</button>
+        <button id="settingsSaveBtn" class="primary" type="button">Save</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="app.js"></script>
+</body>
+</html>

@@ -5,7 +5,7 @@
 function Initialize-Core {
     Set-StrictMode -Off
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $script:AppVersion = '1.2.1'
+    $script:AppVersion = '1.3.0'
     $script:RepoSlug = 'Adenoidcash/episode-renamer'
     $script:VideoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.ts', '.m2ts', '.webm', '.flv', '.mpg', '.mpeg')
     $script:SubExt = @('.srt', '.ass', '.ssa', '.sub', '.idx', '.vtt', '.sup')
@@ -43,6 +43,16 @@ function Get-Settings {
         TvdbApiKey = ''
         TvdbPin    = ''
         TmdbKey    = ''
+        SonarrUrl  = ''
+        SonarrKey  = ''
+        RadarrUrl  = ''
+        RadarrKey  = ''
+        PlexUrl    = ''
+        PlexToken  = ''
+        JellyfinUrl = ''
+        JellyfinKey = ''
+        ArrSync    = $true
+        Theme      = 'System'
         TvRoot     = ''
         MovieRoot  = ''
         MovieFolders = $true
@@ -64,7 +74,8 @@ function Save-Settings($Settings) {
 # ---------------------------------------------------------------- http
 
 function Invoke-Json {
-    param([string]$Url, [string]$Method = 'GET', $Body = $null, [hashtable]$Headers = @{}, [int]$MaxAttempts = 4)
+    # -Raw returns the response text unparsed; a [string] $Body is sent exactly as given.
+    param([string]$Url, [string]$Method = 'GET', $Body = $null, [hashtable]$Headers = @{}, [int]$MaxAttempts = 4, [switch]$AllowEmpty, [switch]$Raw)
     for ($attempt = 1; ; $attempt++) {
         # TVmaze allows ~20 calls per 10 seconds; space calls out so whole-library scans don't hit the limit.
         if ($Url -like 'https://api.tvmaze.com/*') {
@@ -82,7 +93,8 @@ function Invoke-Json {
         $resp = $null
         try {
             if ($Method -ne 'GET') {
-                $bytes = [Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Compress))
+                $payload = if ($Body -is [string]) { $Body } else { ConvertTo-Json -InputObject $Body -Compress -Depth 20 }
+                $bytes = [Text.Encoding]::UTF8.GetBytes($payload)
                 $req.ContentType = 'application/json'
                 $req.ContentLength = $bytes.Length
                 $rs = $req.GetRequestStream(); $rs.Write($bytes, 0, $bytes.Length); $rs.Close()
@@ -91,6 +103,8 @@ function Invoke-Json {
             $reader = New-Object IO.StreamReader($resp.GetResponseStream(), [Text.Encoding]::UTF8)
             $text = $reader.ReadToEnd()
             $reader.Close()
+            if ($Raw) { return $text }
+            if (-not $text.Trim()) { return $null }   # e.g. Plex/Jellyfin refresh calls answer with no body
             return ($text | ConvertFrom-Json)
         } catch [System.Net.WebException] {
             $eresp = $_.Exception.Response
@@ -102,7 +116,7 @@ function Invoke-Json {
             $detail = ''
             if ($eresp) { try { $detail = (New-Object IO.StreamReader($eresp.GetResponseStream())).ReadToEnd().Trim() } catch { } }
             if ($detail.StartsWith('<') -or $detail.Length -gt 300) { $detail = '' }
-            $msg = if ($code -eq 0) { "Couldn't reach $site. Check the internet connection. ($($_.Exception.Message))" }
+            $msg = if ($code -eq 0) { "Couldn't connect to $site. The site may be down, or the internet connection is having trouble." }
             elseif ($code -ge 500) { "$site is having problems right now (error $code). Try again in a few minutes." }
             else { "$site returned error $code." + $(if ($detail) { " $detail" } else { '' }) }
             $ex = New-Object Exception($msg)
@@ -606,6 +620,7 @@ function Undo-LastRename {
     [array]::Reverse($entries)
     $ok = 0
     $errors = @()
+    $restored = New-Object System.Collections.Generic.List[object]
     foreach ($e in $entries) {
         $kind = if ($e.Kind) { $e.Kind } else { 'File' }   # logs from 1.1 have no Kind
         try {
@@ -627,13 +642,14 @@ function Undo-LastRename {
                     if ($isDir) { [IO.Directory]::Move($e.To, $e.From) } else { [IO.File]::Move($e.To, $e.From) }
                 }
                 $ok++
+                $restored.Add([pscustomobject]@{ Kind = $kind; From = $e.From; To = $e.To })
             }
         } catch {
             $errors += $_.Exception.Message
         }
     }
     Move-Item -LiteralPath $file.FullName -Destination ($file.FullName + '.undone') -Force
-    [pscustomobject]@{ Restored = $ok; Errors = $errors }
+    [pscustomobject]@{ Restored = $ok; Errors = $errors; Entries = $restored.ToArray() }
 }
 
 # ---------------------------------------------------------------- library helpers
@@ -674,14 +690,230 @@ function Select-BestMatch($Results, $Year) {
     $r[0]
 }
 
-function Find-Shows([string]$Query, $Ctx) {
-    if ($Ctx.Source -eq 'TheTVDB') { Connect-Tvdb $Ctx.TvdbKey $Ctx.TvdbPin; return @(Search-Tvdb $Query $Ctx.Lang) }
-    @(Search-TVmaze $Query)
+# Searches the chosen TV source. If it's down (TVmaze has outages) or - for Sonarr - doesn't have the
+# show, the other configured sources are tried: Sonarr, TVmaze, TheTVDB.
+function Find-Shows([string]$Query, $Ctx, [string]$FolderLeaf = '') {
+    $sources = New-Object System.Collections.Generic.List[string]
+    $sources.Add($(if ($Ctx.Source) { $Ctx.Source } else { 'TVmaze' }))
+    if ($Ctx.SonarrUrl -and $Ctx.SonarrKey) { $sources.Add('Sonarr') }
+    $sources.Add('TVmaze')
+    if ($Ctx.TvdbKey) { $sources.Add('TheTVDB') }
+    $failed = @()
+    foreach ($src in @($sources | Select-Object -Unique)) {
+        try {
+            $r = switch ($src) {
+                'Sonarr'  { @(Search-Sonarr $Query $Ctx $FolderLeaf) }
+                'TheTVDB' { Connect-Tvdb $Ctx.TvdbKey $Ctx.TvdbPin; @(Search-Tvdb $Query $Ctx.Lang) }
+                default   { @(Search-TVmaze $Query) }
+            }
+            if (@($r).Count) { return @($r) }
+        } catch {
+            $code = $_.Exception.Data['StatusCode']
+            # Only fall through on outages; a bad key etc. should be reported as-is.
+            if ($null -ne $code -and $code -ne 0 -and $code -lt 500) { throw }
+            $failed += "$src ($($_.Exception.Message))"
+        }
+    }
+    if ($failed.Count) {
+        $hint = if (-not ($Ctx.SonarrUrl -or $Ctx.TvdbKey)) { ' Connecting Sonarr or adding a TheTVDB key in Settings gives the app somewhere else to look when this happens.' } else { '' }
+        throw "Couldn't search for '$Query': $($failed -join '; ').$hint"
+    }
+    @()
 }
 
 function Get-ShowEpisodes($Show, $Ctx) {
-    if ($Show.Source -eq 'TheTVDB') { Connect-Tvdb $Ctx.TvdbKey $Ctx.TvdbPin; return @(Get-TvdbEpisodes $Show.Id $Ctx.Order $Ctx.Lang) }
+    switch ($Show.Source) {
+        'Sonarr'  { return @(Get-SonarrEpisodes $Show.Id $Ctx) }
+        'TheTVDB' { Connect-Tvdb $Ctx.TvdbKey $Ctx.TvdbPin; return @(Get-TvdbEpisodes $Show.Id $Ctx.Order $Ctx.Lang) }
+    }
     @(Get-TVmazeEpisodes $Show.Id $Ctx.Order)
+}
+
+# ---------------------------------------------------------------- Sonarr / Radarr / Plex / Jellyfin
+# Sonarr and Radarr track files by path. Renaming behind their back makes them show episodes as
+# missing ("season incomplete") until they rescan, and a renamed show/movie folder leaves them
+# pointing at a folder that no longer exists. When connected, the app updates their folder path and
+# triggers a rescan after renaming. Using Sonarr as the TV source also means episodes are numbered
+# exactly the way Sonarr expects (TheTVDB order), which matters most for anime.
+
+function Get-ArrBase([string]$Url) {
+    $u = $Url.Trim().TrimEnd('/')
+    if ($u -and $u -notmatch '^https?://') { $u = "http://$u" }
+    $u
+}
+
+function Invoke-Arr([string]$App, $Ctx, [string]$Path, [string]$Method = 'GET', $Body = $null, [switch]$Raw) {
+    $url = if ($App -eq 'Sonarr') { $Ctx.SonarrUrl } else { $Ctx.RadarrUrl }
+    $key = if ($App -eq 'Sonarr') { $Ctx.SonarrKey } else { $Ctx.RadarrKey }
+    if (-not $url -or -not $key) { throw "$App isn't connected (Settings)." }
+    try {
+        Invoke-Json "$(Get-ArrBase $url)/api/v3/$Path" $Method $Body @{ 'X-Api-Key' = $key } -MaxAttempts 2 -Raw:$Raw
+    } catch {
+        if ($_.Exception.Data['StatusCode'] -eq 401) { throw "$App rejected the API key. Check it in Settings." }
+        throw
+    }
+}
+
+function Get-PathLeaf([string]$Path) { ($Path.TrimEnd('\', '/') -split '[\\/]')[-1] }
+
+function ConvertTo-SonarrShow($s) {
+    [pscustomobject]@{ Source = 'Sonarr'; Id = $s.id; Name = $s.title; Year = "$($s.year)"; Display = "$($s.title) ($($s.year))  [in Sonarr]"; Path = $s.path }
+}
+
+# Shows already in Sonarr: the one whose folder has this name first, then titles that match well.
+function Search-Sonarr([string]$Query, $Ctx, [string]$FolderLeaf = '') {
+    $all = @(Invoke-Arr 'Sonarr' $Ctx 'series')
+    $byFolder = @($all | Where-Object { $FolderLeaf -and (Get-PathLeaf $_.path) -eq $FolderLeaf })
+    $byTitle = @($all | Where-Object { $byFolder -notcontains $_ } | ForEach-Object {
+            $score = [Math]::Max((Get-TitleSimilarity $_.title $Query), (Get-TitleSimilarity $Query $_.title))
+            if ($score -ge 0.75) { [pscustomobject]@{ S = $_; Score = $score } }
+        } | Sort-Object Score -Descending | ForEach-Object { $_.S })
+    @($byFolder) + @($byTitle) | ForEach-Object { ConvertTo-SonarrShow $_ }
+}
+
+function Get-SonarrEpisodes($SeriesId, $Ctx) {
+    $eps = foreach ($e in @(Invoke-Arr 'Sonarr' $Ctx "episode?seriesId=$SeriesId")) {
+        [pscustomobject]@{
+            Season   = [int]$e.seasonNumber
+            Number   = [int]$e.episodeNumber
+            Absolute = if ($e.absoluteEpisodeNumber) { [int]$e.absoluteEpisodeNumber } else { $null }
+            Title    = if ($e.title) { $e.title } else { "Episode $($e.episodeNumber)" }
+            AirDate  = $e.airDate
+        }
+    }
+    Complete-AbsoluteNumbers $eps
+}
+
+# Movies through Radarr: films already in Radarr first, then Radarr's own lookup (no TMDB key needed).
+function Search-Radarr([string]$Query, $Year, $Ctx, [string]$FolderLeaf = '') {
+    $all = @(Invoke-Arr 'Radarr' $Ctx 'movie')
+    $mine = @($all | Where-Object { ($FolderLeaf -and (Get-PathLeaf $_.path) -eq $FolderLeaf) -or ((Get-TitleSimilarity $_.title $Query) -ge 0.99 -and (-not $Year -or "$($_.year)" -eq "$Year")) })
+    $found = if ($mine.Count) { $mine } else {
+        $term = if ($Year) { "$Query $Year" } else { $Query }
+        @(Invoke-Arr 'Radarr' $Ctx "movie/lookup?term=$([uri]::EscapeDataString($term))")
+    }
+    foreach ($m in $found) {
+        $where = if ($m.id) { '  [in Radarr]' } else { '' }
+        [pscustomobject]@{ Source = 'Radarr'; Id = $m.tmdbId; Name = $m.title; Year = "$($m.year)"; Display = "$($m.title) ($($m.year))$where" }
+    }
+}
+
+# Swap the last folder of a path, keeping the other app's own separator (it may run on another OS).
+function Set-PathLeaf([string]$Path, [string]$Leaf) {
+    $trimmed = $Path.TrimEnd('\', '/')
+    $i = [Math]::Max($trimmed.LastIndexOf('/'), $trimmed.LastIndexOf('\'))
+    if ($i -lt 0) { return $Leaf }
+    $trimmed.Substring(0, $i + 1) + $Leaf
+}
+
+# After a library rename: point Sonarr/Radarr at renamed folders, rescan, refresh Plex/Jellyfin.
+# Returns one line per thing it did (or couldn't do); never throws.
+function Sync-MediaApps($Done, $Ctx, [string]$Kind, [switch]$Quiet, [switch]$SkipServers) {
+    $log = New-Object System.Collections.Generic.List[string]
+    if ($Ctx.ArrSync -eq $false) { return @() }
+    $seen = @{}
+    $app = if ($Kind -eq 'Movie') { 'Radarr' } else { 'Sonarr' }
+    $connected = if ($Kind -eq 'Movie') { $Ctx.RadarrUrl -and $Ctx.RadarrKey } else { $Ctx.SonarrUrl -and $Ctx.SonarrKey }
+    if ($connected -and @($Done).Count) {
+        try {
+            $all = @(Invoke-Arr $app $Ctx $(if ($Kind -eq 'Movie') { 'movie' } else { 'series' }))
+            foreach ($d in $Done) {
+                $item = $all | Where-Object { (Get-PathLeaf $_.path) -eq $d.OldLeaf } | Select-Object -First 1
+                if (-not $item -and $d.NewLeaf) { $item = $all | Where-Object { (Get-PathLeaf $_.path) -eq $d.NewLeaf } | Select-Object -First 1 }
+                if (-not $item) { if (-not $Quiet) { $log.Add("${app}: '$($d.OldLeaf)' isn't in $app, nothing to update.") }; continue }
+                if ($seen[$item.id] -and -not $d.NewLeaf) { continue }
+                $seen[$item.id] = $true
+                try {
+                    if ($d.NewLeaf -and $d.NewLeaf -ne (Get-PathLeaf $item.path)) {
+                        # Edit only "path" in the raw JSON and send the rest back byte-for-byte: a parse +
+                        # re-serialize round trip in Windows PowerShell can mangle fields (alternate titles).
+                        $res = if ($Kind -eq 'Movie') { 'movie' } else { 'series' }
+                        $raw = Invoke-Arr $app $Ctx "$res/$($item.id)" -Raw
+                        $oldJson = ConvertTo-Json -InputObject ([string]$item.path) -Compress
+                        $newJson = ConvertTo-Json -InputObject (Set-PathLeaf $item.path $d.NewLeaf) -Compress
+                        $pattern = '"path"\s*:\s*' + [regex]::Escape($oldJson)
+                        if (-not [regex]::IsMatch($raw, $pattern)) { throw "couldn't find its folder path in $app's data" }
+                        $updated = [regex]::Replace($raw, $pattern, ('"path":' + $newJson).Replace('$', '$$'))
+                        [void](Invoke-Arr $app $Ctx "$res/$($item.id)?moveFiles=false" 'PUT' $updated)
+                        $log.Add("${app}: '$($item.title)' now points at folder '$($d.NewLeaf)'.")
+                    }
+                    $cmd = if ($Kind -eq 'Movie') { @{ name = 'RescanMovie'; movieId = $item.id } } else { @{ name = 'RescanSeries'; seriesId = $item.id } }
+                    [void](Invoke-Arr $app $Ctx 'command' 'POST' $cmd)
+                    $log.Add("${app}: rescanning '$($item.title)'.")
+                } catch { $log.Add("${app}: couldn't update '$($item.title)': $($_.Exception.Message)") }
+            }
+        } catch { $log.Add("${app}: $($_.Exception.Message)") }
+    }
+    if (-not $SkipServers) { foreach ($line in @(Update-MediaServers $Ctx $Kind)) { $log.Add($line) } }
+    $log.ToArray()
+}
+
+# After an undo: point Sonarr/Radarr back at the original folders and rescan whatever was touched.
+function Sync-AfterUndo($Undo, $Ctx) {
+    if ($Ctx.ArrSync -eq $false) { return @() }
+    $entries = New-Object System.Collections.Generic.List[object]
+    $leaves = @{}
+    foreach ($e in @($Undo.Entries)) {
+        if ($e.Kind -eq 'Dir') { $entries.Add([pscustomobject]@{ OldLeaf = (Get-PathLeaf $e.To); NewLeaf = (Get-PathLeaf $e.From) }) }
+        elseif ($e.Kind -eq 'File') {
+            # The show/movie folder is the file's parent or grandparent (Season folder in between).
+            $p = Split-Path $e.From -Parent
+            foreach ($lvl in 1, 2) { if ($p) { $leaves[(Get-PathLeaf $p)] = $true; $p = Split-Path $p -Parent } }
+        }
+    }
+    foreach ($l in $leaves.Keys) { $entries.Add([pscustomobject]@{ OldLeaf = $l; NewLeaf = '' }) }
+    if ($entries.Count -eq 0) { return @() }
+    $lines = @()
+    if ($Ctx.SonarrUrl -and $Ctx.SonarrKey) { $lines += @(Sync-MediaApps $entries.ToArray() $Ctx 'TV' -Quiet -SkipServers) }
+    if ($Ctx.RadarrUrl -and $Ctx.RadarrKey) { $lines += @(Sync-MediaApps $entries.ToArray() $Ctx 'Movie' -Quiet -SkipServers) }
+    $lines += @(Update-MediaServers $Ctx 'TV')
+    $lines += @(Update-MediaServers $Ctx 'Movie')
+    @($lines | Where-Object { $_ })
+}
+
+# Which show/movie folders a finished library rename touched: { OldLeaf; NewLeaf } (NewLeaf '' = unchanged).
+function Get-SyncEntries($Results) {
+    foreach ($r in @($Results)) {
+        if ($r.Error) { continue }
+        $p = $r.Plan
+        if ($p.Kind -eq 'Show') {
+            [pscustomobject]@{ OldLeaf = (Split-Path $p.Dir -Leaf); NewLeaf = $p.NewName }
+        } elseif ($p.NewName -match '[\\/]') {
+            $newFolder = ($p.NewName -split '[\\/]')[0]
+            $old = if ($p.Item.Type -eq 'Folder') { Split-Path $p.Item.Path -Leaf } else { $newFolder }
+            [pscustomobject]@{ OldLeaf = $old; NewLeaf = $newFolder }
+        }
+    }
+}
+
+# Ask Plex / Jellyfin to rescan their libraries of this kind.
+function Update-MediaServers($Ctx, [string]$Kind) {
+    if ($Ctx.PlexUrl -and $Ctx.PlexToken) {
+        try {
+            $base = Get-ArrBase $Ctx.PlexUrl
+            $h = @{ 'X-Plex-Token' = $Ctx.PlexToken }
+            $want = if ($Kind -eq 'Movie') { 'movie' } else { 'show' }
+            $secs = @((Invoke-Json "$base/library/sections" -Headers $h -MaxAttempts 2).MediaContainer.Directory | Where-Object { $_.type -eq $want })
+            foreach ($s in $secs) { [void](Invoke-Json "$base/library/sections/$($s.key)/refresh" -Headers $h -MaxAttempts 1 -AllowEmpty) }
+            "Plex: refreshing $($secs.Count) $want librar$(if ($secs.Count -eq 1) { 'y' } else { 'ies' })."
+        } catch { "Plex: couldn't refresh ($($_.Exception.Message))" }
+    }
+    if ($Ctx.JellyfinUrl -and $Ctx.JellyfinKey) {
+        try {
+            [void](Invoke-Json "$(Get-ArrBase $Ctx.JellyfinUrl)/Library/Refresh" 'POST' $null @{ 'X-Emby-Token' = $Ctx.JellyfinKey } -MaxAttempts 1 -AllowEmpty)
+            'Jellyfin: library scan started.'
+        } catch { "Jellyfin: couldn't refresh ($($_.Exception.Message))" }
+    }
+}
+
+# "Test" buttons in Settings.
+function Test-MediaApp([string]$App, $Ctx) {
+    switch ($App) {
+        'Sonarr'   { $s = Invoke-Arr 'Sonarr' $Ctx 'system/status'; "Connected to Sonarr $($s.version)." }
+        'Radarr'   { $s = Invoke-Arr 'Radarr' $Ctx 'system/status'; "Connected to Radarr $($s.version)." }
+        'Plex'     { $s = Invoke-Json "$(Get-ArrBase $Ctx.PlexUrl)/identity" -Headers @{ 'X-Plex-Token' = $Ctx.PlexToken } -MaxAttempts 1; "Connected to Plex $($s.MediaContainer.version)." }
+        'Jellyfin' { $s = Invoke-Json "$(Get-ArrBase $Ctx.JellyfinUrl)/System/Info" -Headers @{ 'X-Emby-Token' = $Ctx.JellyfinKey } -MaxAttempts 1; "Connected to Jellyfin $($s.Version)." }
+    }
 }
 
 # ---------------------------------------------------------------- TV library planner
@@ -710,7 +942,7 @@ function Get-ShowPlan([string]$ShowDir, $Ctx, $ForcedShow) {
         $eps = $null
         if ($ForcedShow) { $plan.Match = $ForcedShow }
         else {
-            $plan.Results = @(Find-Shows $ft.Title $Ctx)
+            $plan.Results = @(Find-Shows $ft.Title $Ctx $leaf)
             $plan.Match = Select-BestMatch $plan.Results $ft.Year
             # "One Piece" with no year matches the anime and the live-action show; pick the one whose
             # episode list actually contains the files in the folder.
@@ -945,10 +1177,20 @@ function Get-MoviePlan($Item, $Ctx, $ForcedMovie) {
     $notes = @()
     try {
         if ($ForcedMovie) { $plan.Match = $ForcedMovie }
-        elseif ($Ctx.TmdbKey) {
-            $plan.Results = @(Search-Tmdb $guess.Title $guess.Year $Ctx.TmdbKey)
-            $plan.Match = Select-BestMatch $plan.Results $guess.Year
-            if (-not $plan.Match) { $notes += 'not found on TMDB, using the filename' }
+        else {
+            # Radarr first (it also knows which folder each movie is in), then TMDB, then the filename.
+            if ($Ctx.RadarrUrl -and $Ctx.RadarrKey) {
+                try {
+                    $folderLeaf = if ($Item.Type -eq 'Folder') { $leaf } else { '' }
+                    $plan.Results = @(Search-Radarr $guess.Title $guess.Year $Ctx $folderLeaf)
+                    $plan.Match = Select-BestMatch $plan.Results $guess.Year
+                } catch { $notes += "Radarr lookup failed ($($_.Exception.Message))" }
+            }
+            if (-not $plan.Match -and $Ctx.TmdbKey) {
+                $plan.Results = @(Search-Tmdb $guess.Title $guess.Year $Ctx.TmdbKey)
+                $plan.Match = Select-BestMatch $plan.Results $guess.Year
+            }
+            if (-not $plan.Match -and ($Ctx.TmdbKey -or $Ctx.RadarrUrl)) { $notes += 'not found online, using the filename' }
         }
         if (-not $plan.Match) {
             if (-not $guess.Title) { $plan.Status = 'Could not read a title'; return $plan }

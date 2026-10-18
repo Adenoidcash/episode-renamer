@@ -12,6 +12,10 @@ try {
     Add-Type -Name Dpi -Namespace Win32 -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();'
     [void][Win32.Dpi]::SetProcessDPIAware()
 } catch { }
+try {
+    # Dark title bars (Windows 10 2004+ / Windows 11).
+    Add-Type -Name Dwm -Namespace Win32 -MemberDefinition '[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);'
+} catch { }
 [Windows.Forms.Application]::EnableVisualStyles()
 
 $settings = Get-Settings
@@ -55,10 +59,24 @@ function New-TextBox([int]$Width) {
     $c.Width = $Width; $c.Margin = New-Pad 3 4 3 3
     $c
 }
+# Dropdowns are owner-drawn in dark mode: Windows ignores BackColor on DropDownList combo boxes.
+$script:DrawCombo = {
+    param($sender, $e)
+    if ($e.Index -lt 0) { return }
+    $p = $script:Pal
+    $selected = ($e.State -band [Windows.Forms.DrawItemState]::Selected) -ne 0
+    $brush = New-Object Drawing.SolidBrush $(if ($selected) { $p.Sel } else { $p.Input })
+    $e.Graphics.FillRectangle($brush, $e.Bounds)
+    $brush.Dispose()
+    [Windows.Forms.TextRenderer]::DrawText($e.Graphics, [string]$sender.Items[$e.Index], $sender.Font, $e.Bounds, $p.Text,
+        [Windows.Forms.TextFormatFlags]::VerticalCenter -bor [Windows.Forms.TextFormatFlags]::EndEllipsis)
+}
+
 function New-Combo([int]$Width, [string[]]$Items) {
     $c = New-Object Windows.Forms.ComboBox
     $c.Width = $Width; $c.DropDownStyle = 'DropDownList'; $c.Margin = New-Pad 3 4 3 3
     foreach ($i in $Items) { [void]$c.Items.Add($i) }
+    $c.Add_DrawItem($script:DrawCombo)
     $c
 }
 function New-CheckBox([string]$Text) {
@@ -102,15 +120,71 @@ function New-Grid([object[]]$Columns) {
     $g
 }
 
+# A simple tab strip (header buttons + swappable pages). Used instead of TabControl because Windows
+# always paints a light frame around TabControl pages, which can't be themed for dark mode.
+function New-TabHost {
+    $t = New-Stack
+    $t.Margin = New-Pad 0 6 0 0
+    $hdr = New-Row
+    $hdr.WrapContents = $false
+    $body = New-Object Windows.Forms.Panel
+    $body.Dock = 'Fill'
+    $body.Padding = New-Pad 2 6 2 2
+    Add-StackRow $t $hdr
+    Add-StackRow $t $body -Fill
+    $obj = [pscustomobject]@{ Control = $t; Header = $hdr; Body = $body; Pages = (New-Object System.Collections.ArrayList); SelectedTab = $null }
+    $t.Tag = $obj
+    $obj
+}
+
+function Add-TabPage($TabHost, [string]$Title) {
+    $page = New-Object Windows.Forms.Panel
+    $page.Dock = 'Fill'
+    $page.Visible = $false
+    $page.Text = $Title
+    $btn = New-Object Windows.Forms.Button
+    $btn.Text = $Title; $btn.AutoSize = $true; $btn.Name = 'tabbtn'
+    $btn.FlatStyle = 'Flat'; $btn.FlatAppearance.BorderSize = 0
+    $btn.Margin = New-Pad 0 0 2 0; $btn.Padding = New-Pad 10 3 10 3
+    $btn.Tag = @{ Host = $TabHost; Page = $page }
+    $btn.Add_Click({ Select-TabPage $this.Tag.Host $this.Tag.Page })
+    $TabHost.Header.Controls.Add($btn)
+    $TabHost.Body.Controls.Add($page)
+    [void]$TabHost.Pages.Add($page)
+    if (-not $TabHost.SelectedTab) { Select-TabPage $TabHost $page }
+    $page
+}
+
+function Select-TabPage($TabHost, $Page) {
+    foreach ($p in $TabHost.Pages) { $p.Visible = ($p -eq $Page) }
+    $TabHost.SelectedTab = $Page
+    Update-TabHeader $TabHost
+}
+
+function Update-TabHeader($TabHost) {
+    $p = $script:Pal
+    if (-not $p) { return }   # pages created before the theme is set up; Set-AppTheme styles them
+    foreach ($b in $TabHost.Header.Controls) {
+        $sel = $b.Tag.Page -eq $TabHost.SelectedTab
+        $b.FlatStyle = 'Flat'
+        $b.FlatAppearance.BorderSize = 0
+        $b.FlatAppearance.MouseOverBackColor = $p.Surface
+        $b.BackColor = if ($sel) { $p.Surface } else { $p.Back }
+        $b.ForeColor = if ($sel) { $p.Accent } else { $p.Muted }
+        $b.Font = if ($sel) { $script:BoldFont } else { $form.Font }
+    }
+}
+
 function Set-StatusColor($Cell, [string]$Status) {
+    $p = $script:Pal
     $Cell.Style.ForeColor = switch -Wildcard ($Status) {
-        'Ready*'      { [Drawing.Color]::DarkGreen }
-        'Renamed*'    { [Drawing.Color]::DarkGreen }
-        'Rename folder' { [Drawing.Color]::DarkGreen }
-        'Unchanged'   { [Drawing.Color]::Gray }
-        'Up to date*' { [Drawing.Color]::Gray }
-        ''            { [Drawing.Color]::Gray }
-        default       { [Drawing.Color]::Firebrick }
+        'Ready*'      { $p.Ok }
+        'Renamed*'    { $p.Ok }
+        'Rename folder' { $p.Ok }
+        'Unchanged'   { $p.Dim }
+        'Up to date*' { $p.Dim }
+        ''            { $p.Dim }
+        default       { $p.Bad }
     }
 }
 
@@ -132,7 +206,7 @@ $form.Controls.Add($main)
 
 # Shared: where data comes from and how names are built (used by Episodes and TV Library).
 $rowSource = New-Row
-$cboSource = New-Combo 120 @('TVmaze', 'TheTVDB')
+$cboSource = New-Combo 120 @('TVmaze', 'TheTVDB', 'Sonarr')
 $cboOrder = New-Combo 100 @('Aired', 'DVD', 'Absolute')
 $txtLang = New-TextBox 50
 $btnSettings = New-Button 'Settings...'
@@ -152,11 +226,10 @@ $txtScheme = New-TextBox 420
 $btnResetScheme = New-Button 'Reset'
 $lblTokens = New-Label 'Tokens: {show} {season:00} {episode:00} {title} {absolute:000} {year} {airdate}'
 $lblTokens.ForeColor = [Drawing.Color]::DimGray
+$lblTokens.Tag = 'muted'
 $rowScheme.Controls.AddRange(@((New-Label 'Episode name scheme:'), $txtScheme, $btnResetScheme, $lblTokens))
 
-$tabs = New-Object Windows.Forms.TabControl
-$tabs.Dock = 'Fill'
-$tabs.Margin = New-Pad 0 6 0 0
+$tabs = New-TabHost
 
 # Shared status bar.
 $rowStatus = New-Row
@@ -171,13 +244,12 @@ $rowStatus.Controls.AddRange(@($btnUndo, $progress, $lblStatus, $lnkUpdate))
 Add-StackRow $main $rowSource
 Add-StackRow $main $rowMatch
 Add-StackRow $main $rowScheme
-Add-StackRow $main $tabs -Fill
+Add-StackRow $main $tabs.Control -Fill
 Add-StackRow $main $rowStatus
 
 # ---------------------------------------------------------------- Episodes tab
 
-$pageEp = New-Object Windows.Forms.TabPage
-$pageEp.Text = 'Episodes'; $pageEp.Padding = New-Pad 4 4 4 4
+$pageEp = Add-TabPage $tabs 'Episodes'
 $stackEp = New-Stack
 $pageEp.Controls.Add($stackEp)
 
@@ -211,13 +283,11 @@ Add-StackRow $stackEp $rowFolder
 Add-StackRow $stackEp $rowShow
 Add-StackRow $stackEp $grid -Fill
 Add-StackRow $stackEp $rowEpButtons
-$tabs.TabPages.Add($pageEp)
 
 # ---------------------------------------------------------------- library tabs (TV Library, Movies)
 
 function New-LibraryTab([string]$Kind, [string]$Title, [string]$Hint) {
-    $page = New-Object Windows.Forms.TabPage
-    $page.Text = $Title; $page.Padding = New-Pad 4 4 4 4
+    $page = Add-TabPage $tabs $Title
     $stack = New-Stack
     $page.Controls.Add($stack)
 
@@ -228,6 +298,7 @@ function New-LibraryTab([string]$Kind, [string]$Title, [string]$Hint) {
     $rowF.Controls.AddRange(@((New-Label 'Folder:'), $txt, $btnB, $btnA))
     $lblHint = New-Label $Hint
     $lblHint.ForeColor = [Drawing.Color]::DimGray
+    $lblHint.Tag = 'muted'
     $lblHint.Margin = New-Pad 6 2 3 4
 
     $g = New-Grid @(@('Current name', 34), @('New name', 34), @('Matched as', 17), @('Status', 17))
@@ -276,7 +347,6 @@ function New-LibraryTab([string]$Kind, [string]$Title, [string]$Hint) {
             })
     }
 
-    $tabs.TabPages.Add($page)
     [pscustomobject]@{ Kind = $Kind; Page = $page; Txt = $txt; Grid = $g; Plans = @(); Details = $chkDetails; MovieFolders = $chkFolders }
 }
 
@@ -314,7 +384,41 @@ function Get-LookupContext {
         TitleMode = $TitleModes[[string]$cboTitles.SelectedItem]; Scheme = $txtScheme.Text; Extras = $chkExtras.Checked
         MovieFolders = $script:LibTabs['Movie'].MovieFolders.Checked
         TvdbKey = $settings.TvdbApiKey; TvdbPin = $settings.TvdbPin; TmdbKey = $settings.TmdbKey
+        SonarrUrl = $settings.SonarrUrl; SonarrKey = $settings.SonarrKey; RadarrUrl = $settings.RadarrUrl; RadarrKey = $settings.RadarrKey
+        PlexUrl = $settings.PlexUrl; PlexToken = $settings.PlexToken; JellyfinUrl = $settings.JellyfinUrl; JellyfinKey = $settings.JellyfinKey
+        ArrSync = [bool]$settings.ArrSync
     }
+}
+
+# The show folder for the Episodes tab: the scanned folder, or its parent when that's a "Season N" folder.
+function Get-EpisodesShowLeaf {
+    $dir = $txtFolder.Text.Trim().TrimEnd('\')
+    if (-not $dir) { return '' }
+    if ($null -ne (Get-FolderSeason $dir)) { $dir = Split-Path $dir -Parent }
+    Split-Path $dir -Leaf
+}
+
+# After renaming/undo: tell Sonarr/Radarr about moved folders and rescan, refresh Plex/Jellyfin.
+# Runs in the background; the outcome is added to the status bar (and shown if something failed).
+function Start-MediaSync($Entries, [string]$Kind, $UndoResult) {
+    $ctx = Get-LookupContext
+    if (-not $ctx.ArrSync) { return }
+    if (-not (($ctx.SonarrUrl -and $ctx.SonarrKey) -or ($ctx.RadarrUrl -and $ctx.RadarrKey) -or ($ctx.PlexUrl -and $ctx.PlexToken) -or ($ctx.JellyfinUrl -and $ctx.JellyfinKey))) { return }
+    $script:StatusBeforeSync = $lblStatus.Text
+    [void](Start-Background 'Updating Sonarr / Radarr / Plex / Jellyfin...' {
+            param($Entries, $Kind, $UndoResult, $Ctx)
+            $lines = if ($UndoResult) { @(Sync-AfterUndo $UndoResult $Ctx) } else { @(Sync-MediaApps @($Entries) $Ctx $Kind) }
+            @{ Lines = @($lines) }
+        } @{ Entries = @($Entries); Kind = $Kind; UndoResult = $UndoResult; Ctx = $ctx } {
+            param($o)
+            $lines = @($o.Lines | Where-Object { $_ })
+            if ($lines.Count -eq 0) { Set-Status $script:StatusBeforeSync; return }
+            $bad = @($lines | Where-Object { $_ -match "couldn't|rejected|failed|isn't connected" })
+            Set-Status "$($script:StatusBeforeSync)   Media apps: $($lines.Count - $bad.Count) updated$(if ($bad.Count) { ", $($bad.Count) problem(s)" })."
+            $lblStatus.Tag = $lines -join "`n"
+            $tips.SetToolTip($lblStatus, ($lines -join "`n"))
+            if ($bad.Count) { [void][Windows.Forms.MessageBox]::Show($form, ($lines -join "`n"), 'Episode Renamer - media apps', 'OK', 'Warning') }
+        })
 }
 
 # ---------------------------------------------------------------- background work
@@ -329,7 +433,7 @@ $jobTimer.Interval = 100
 function Test-Busy { @($script:Jobs | Where-Object { -not $_.Quiet }).Count -gt 0 }
 
 function Set-Busy([bool]$On) {
-    foreach ($c in @($rowSource, $rowMatch, $rowScheme, $tabs, $btnUndo)) { $c.Enabled = -not $On }
+    foreach ($c in @($rowSource, $rowMatch, $rowScheme, $tabs.Control, $btnUndo)) { $c.Enabled = -not $On }
     $progress.Visible = $On
     $form.UseWaitCursor = $On
 }
@@ -465,12 +569,12 @@ function Invoke-Search {
     $q = $txtSearch.Text.Trim()
     if (-not $q) { throw 'Type a show name to search for.' }
     $src = [string]$cboSource.SelectedItem
-    $params = @{ Query = $q; Ctx = (Get-LookupContext); Token = $script:TvdbToken; YearHint = $script:YearHint
+    $params = @{ Query = $q; Ctx = (Get-LookupContext); Token = $script:TvdbToken; YearHint = $script:YearHint; FolderLeaf = (Get-EpisodesShowLeaf)
         Parsed = @($grid.Rows | ForEach-Object { $_.Tag.Parsed } | Where-Object { $_.Kind -ne 'None' }) }
     [void](Start-Background "Searching $src for '$q'..." {
-            param($Query, $Ctx, $Token, $YearHint, $Parsed)
+            param($Query, $Ctx, $Token, $YearHint, $Parsed, $FolderLeaf)
             $script:TvdbToken = $Token
-            $r = @(Find-Shows $Query $Ctx)
+            $r = @(Find-Shows $Query $Ctx $FolderLeaf)
             # Several shows with exactly this name and no year to go on (anime vs live-action One Piece):
             # pick the one whose episode list contains the most of the files, like the TV Library tab does.
             $pick = -1
@@ -645,6 +749,7 @@ function Invoke-Rename {
     if ($extraErrors.Count) {
         [void][Windows.Forms.MessageBox]::Show($form, "Some extra files couldn't be renamed:`n`n" + (($extraErrors | Select-Object -First 10) -join "`n"), 'Episode Renamer', 'OK', 'Warning')
     }
+    if ($ok -gt 0) { Start-MediaSync @([pscustomobject]@{ OldLeaf = (Get-EpisodesShowLeaf); NewLeaf = '' }) 'TV' $null }
 }
 
 # ---------------------------------------------------------------- library tabs: analyze, show, rename, re-match
@@ -708,7 +813,7 @@ function Show-LibraryPlans($St) {
             $child.Cells[0] = New-Object Windows.Forms.DataGridViewTextBoxCell
             $child.Cells[0].ReadOnly = $true
             $child.Tag = @{ Plan = $p; Index = $i; Parent = $false }
-            $child.DefaultCellStyle.ForeColor = [Drawing.Color]::DimGray
+            $child.DefaultCellStyle.ForeColor = $script:Pal.Child
             Set-StatusColor $child.Cells[4] $r.Status
             $child.Visible = $St.Details.Checked
         }
@@ -723,7 +828,7 @@ function Invoke-LibraryRename($St) {
     if ($rows.Count -eq 0) { throw 'Nothing is checked that has changes to make.' }
     $opCount = ($rows | ForEach-Object { @($_.Tag.Plan.Ops | Where-Object { $_.Op -ne 'RmDirIfEmpty' }).Count } | Measure-Object -Sum).Sum
     $what = if ($St.Kind -eq 'TV') { 'show(s)' } else { 'movie(s)' }
-    if (-not (Confirm-Action "Apply $opCount rename(s) across $($rows.Count) $what?`n`nYou can put everything back with ""Undo last rename"".")) { return }
+    if (-not (Confirm-Action "Apply $opCount rename(s) across $($rows.Count) $($what)?`n`nYou can put everything back with ""Undo last rename"".")) { return }
     $results = Invoke-LibraryPlans @($rows | ForEach-Object { $_.Tag.Plan })
     $ok = 0
     foreach ($r in $results) {
@@ -738,6 +843,7 @@ function Invoke-LibraryRename($St) {
         Set-StatusColor $row.Cells[4] $row.Cells[4].Value
     }
     Set-Status "Done: $ok of $($rows.Count) $what renamed. Click Analyze to see the result."
+    if ($ok -gt 0) { Start-MediaSync @(Get-SyncEntries $results) $St.Kind $null }
 }
 
 function Show-ChangeMatch($St) {
@@ -774,6 +880,7 @@ function Show-ChangeMatch($St) {
     Add-StackRow $stack $rowBtn
     $dlg.Controls.Add($stack)
     $dlg.AcceptButton = $btnFind; $dlg.CancelButton = $cancel
+    Set-WindowTheme $dlg
     $script:DlgKind = $St.Kind
     $btnFind.Add_Click({
             Invoke-Safe {
@@ -783,8 +890,9 @@ function Show-ChangeMatch($St) {
                 $form.UseWaitCursor = $true
                 try {
                     if ($script:DlgKind -eq 'TV') { $res = @(Find-Shows $q $ctx) }
+                    elseif ($ctx.RadarrUrl -and $ctx.RadarrKey) { $res = @(Search-Radarr $q $y $ctx) }
                     elseif ($settings.TmdbKey) { $res = @(Search-Tmdb $q $y $settings.TmdbKey) }
-                    else { throw 'Searching for movies needs a TMDB key (Settings). Without one, type the title and year and click "Use title and year as typed".' }
+                    else { throw 'Searching for movies needs Radarr or a TMDB key (Settings). Without either, type the title and year and click "Use title and year as typed".' }
                 } finally { $form.UseWaitCursor = $false }
                 $script:DlgResults = $res
                 $script:DlgList.Items.Clear()
@@ -833,49 +941,243 @@ function Invoke-Undo {
     [void][Windows.Forms.MessageBox]::Show($form, $msg, 'Episode Renamer', 'OK', 'Information')
     if ($tabs.SelectedTab -eq $pageEp) {
         if ($txtFolder.Text.Trim() -and (Test-Path -LiteralPath $txtFolder.Text.Trim())) { Invoke-Scan }
+        Set-Status $msg.Split("`n")[0]
+        Start-MediaSync @() 'TV' $r
     } else {
-        foreach ($st in $script:LibTabs.Values) { if ($st.Page -eq $tabs.SelectedTab -and @($st.Plans).Count) { Start-Analyze $st } }
+        # Re-analyzing would race the media-app update for the busy slot; show the result and let the user re-analyze.
+        foreach ($st in $script:LibTabs.Values) { if ($st.Page -eq $tabs.SelectedTab) { $st.Plans = @(); Show-LibraryPlans $st } }
+        Set-Status ($msg.Split("`n")[0] + ' Click Analyze to see the folder as it is now.')
+        Start-MediaSync @() 'TV' $r
     }
 }
+
+function New-LinkLabel([string]$Text, [string]$Url) {
+    $l = New-Object Windows.Forms.LinkLabel
+    $l.Text = $Text; $l.AutoSize = $true; $l.Margin = New-Pad 6 2 3 8; $l.Tag = $Url
+    $l.Add_LinkClicked({ Start-Process $this.Tag })
+    $l
+}
+
+# One "label / text box" row in a settings grid; returns the text box.
+function Add-SettingRow($Table, [string]$Label, [string]$Value, [switch]$Secret) {
+    $tb = New-TextBox 330
+    $tb.Text = "$Value"
+    if ($Secret) { $tb.UseSystemPasswordChar = $true }
+    $Table.Controls.Add((New-Label $Label))
+    $Table.Controls.Add($tb)
+    $tb
+}
+
+function New-SettingsPage($Tabs, [string]$Title) {
+    $page = Add-TabPage $Tabs $Title
+    $page.Padding = New-Pad 8 8 8 8
+    $t = New-Object Windows.Forms.TableLayoutPanel
+    $t.AutoSize = $true; $t.ColumnCount = 3; $t.Dock = 'Fill'
+    $page.Controls.Add($t)
+    $t
+}
+
+function Add-SpanRow($Table, $Control) { $Table.Controls.Add($Control); $Table.SetColumnSpan($Control, 3) }
 
 function Show-SettingsDialog {
     $dlg = New-Object Windows.Forms.Form
     $dlg.Text = 'Settings'; $dlg.Font = $form.Font; $dlg.AutoScaleMode = 'Dpi'
     $dlg.FormBorderStyle = 'FixedDialog'; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
-    $dlg.StartPosition = 'CenterParent'; $dlg.AutoSize = $true; $dlg.AutoSizeMode = 'GrowAndShrink'; $dlg.Padding = New-Pad 10 10 10 10
-    $t = New-Object Windows.Forms.TableLayoutPanel
-    $t.AutoSize = $true; $t.ColumnCount = 2; $t.Dock = 'Fill'
-    $info = New-Label "All keys are optional. TVmaze (TV) and filename-based movie names work without any."
-    $t.Controls.Add($info); $t.SetColumnSpan($info, 2)
-    $txtKey = New-TextBox 360; $txtKey.Text = $settings.TvdbApiKey
-    $txtPin = New-TextBox 360; $txtPin.Text = $settings.TvdbPin
-    $txtTmdb = New-TextBox 360; $txtTmdb.Text = $settings.TmdbKey
-    $t.Controls.Add((New-Label 'TheTVDB API key:')); $t.Controls.Add($txtKey)
-    $t.Controls.Add((New-Label 'TheTVDB subscriber PIN:')); $t.Controls.Add($txtPin)
-    $link = New-Object Windows.Forms.LinkLabel
-    $link.Text = 'Get a TheTVDB key: https://thetvdb.com/api-information'; $link.AutoSize = $true; $link.Margin = New-Pad 6 2 3 10
-    $link.Add_LinkClicked({ Start-Process 'https://thetvdb.com/api-information' })
-    $t.Controls.Add($link); $t.SetColumnSpan($link, 2)
-    $t.Controls.Add((New-Label 'TMDB API key (movies):')); $t.Controls.Add($txtTmdb)
-    $link2 = New-Object Windows.Forms.LinkLabel
-    $link2.Text = 'Get a free TMDB key: https://www.themoviedb.org/settings/api'; $link2.AutoSize = $true; $link2.Margin = New-Pad 6 2 3 10
-    $link2.Add_LinkClicked({ Start-Process 'https://www.themoviedb.org/settings/api' })
-    $t.Controls.Add($link2); $t.SetColumnSpan($link2, 2)
+    $dlg.StartPosition = 'CenterParent'; $dlg.ClientSize = New-Object Drawing.Size(640, 470); $dlg.Padding = New-Pad 8 8 8 8
+    $outer = New-Stack
+    $dlg.Controls.Add($outer)
+    $st = New-TabHost
+
+    # Lookups
+    $t1 = New-SettingsPage $st 'Lookups'
+    Add-SpanRow $t1 (New-Label 'All keys are optional. TVmaze (TV) and filename-based movie names work without any.')
+    $txtTvdb = Add-SettingRow $t1 'TheTVDB API key:' $settings.TvdbApiKey -Secret; $t1.Controls.Add((New-Label ''))
+    $txtPin = Add-SettingRow $t1 'TheTVDB subscriber PIN:' $settings.TvdbPin -Secret; $t1.Controls.Add((New-Label ''))
+    Add-SpanRow $t1 (New-LinkLabel 'Get a TheTVDB key: https://thetvdb.com/api-information' 'https://thetvdb.com/api-information')
+    $txtTmdb = Add-SettingRow $t1 'TMDB API key (movies):' $settings.TmdbKey -Secret; $t1.Controls.Add((New-Label ''))
+    Add-SpanRow $t1 (New-LinkLabel 'Get a free TMDB key: https://www.themoviedb.org/settings/api' 'https://www.themoviedb.org/settings/api')
+    $credit = New-Label 'TV information from TVmaze (tvmaze.com) and TheTVDB (thetvdb.com). Movie information from TMDB (themoviedb.org). This app is not endorsed or certified by TheTVDB or TMDB.'
+    $credit.MaximumSize = New-Object Drawing.Size(580, 0); $credit.Tag = 'muted'; $credit.Margin = New-Pad 6 14 3 0
+    Add-SpanRow $t1 $credit
+
+    # Media apps
+    $t2 = New-SettingsPage $st 'Media apps'
+    $intro = New-Label 'Optional. When connected, the app tells these programs about renamed folders and rescans, so Sonarr/Radarr don''t show episodes or movies as missing. Choose "Sonarr" as the TV source to name episodes exactly the way Sonarr numbers them.'
+    $intro.MaximumSize = New-Object Drawing.Size(580, 0)
+    Add-SpanRow $t2 $intro
+    $script:SetBoxes = @{}
+    foreach ($app in @(
+            @{ Name = 'Sonarr'; Url = 'SonarrUrl'; Key = 'SonarrKey'; Hint = 'http://192.168.1.10:8989'; KeyLabel = 'API key' },
+            @{ Name = 'Radarr'; Url = 'RadarrUrl'; Key = 'RadarrKey'; Hint = 'http://192.168.1.10:7878'; KeyLabel = 'API key' },
+            @{ Name = 'Plex'; Url = 'PlexUrl'; Key = 'PlexToken'; Hint = 'http://192.168.1.10:32400'; KeyLabel = 'token' },
+            @{ Name = 'Jellyfin'; Url = 'JellyfinUrl'; Key = 'JellyfinKey'; Hint = 'http://192.168.1.10:8096'; KeyLabel = 'API key' })) {
+        $u = Add-SettingRow $t2 "$($app.Name) address:" $settings[$app.Url]
+        $tips.SetToolTip($u, "For example $($app.Hint)")
+        $btnTest = New-Button 'Test'; $btnTest.Tag = $app.Name
+        $t2.Controls.Add($btnTest)
+        $k = Add-SettingRow $t2 "$($app.Name) $($app.KeyLabel):" $settings[$app.Key] -Secret; $t2.Controls.Add((New-Label ''))
+        $script:SetBoxes[$app.Url] = $u; $script:SetBoxes[$app.Key] = $k
+        $btnTest.Add_Click({
+                $name = $this.Tag
+                $ctx = Get-LookupContext
+                foreach ($key in @($script:SetBoxes.Keys)) { $ctx[$key] = $script:SetBoxes[$key].Text.Trim() }
+                $dlgForm = $this.FindForm()
+                $dlgForm.UseWaitCursor = $true
+                try { $msg = Test-MediaApp $name $ctx; $icon = 'Information' }
+                catch { $msg = "$name : $($_.Exception.Message)"; $icon = 'Warning' }
+                finally { $dlgForm.UseWaitCursor = $false }
+                [void][Windows.Forms.MessageBox]::Show($dlgForm, $msg, 'Episode Renamer', 'OK', $icon)
+            })
+    }
+    $chkSync = New-CheckBox 'After renaming, update Sonarr/Radarr folders and rescan, and refresh Plex/Jellyfin'
+    $chkSync.Checked = [bool]$settings.ArrSync
+    Add-SpanRow $t2 $chkSync
+    $where = New-Label 'API keys: Sonarr/Radarr Settings > General. Plex token: support.plex.tv "Finding an authentication token". Jellyfin: Dashboard > API Keys.'
+    $where.MaximumSize = New-Object Drawing.Size(580, 0); $where.Tag = 'muted'; $where.Margin = New-Pad 6 10 3 0
+    Add-SpanRow $t2 $where
+
+    # Appearance
+    $t3 = New-SettingsPage $st 'Appearance'
+    $cboTheme = New-Combo 160 @('System', 'Light', 'Dark')
+    $cboTheme.SelectedItem = if (@('System', 'Light', 'Dark') -contains $settings.Theme) { $settings.Theme } else { 'System' }
+    $t3.Controls.Add((New-Label 'Theme:')); $t3.Controls.Add($cboTheme)
+    $tn = New-Label '"System" follows the Windows light/dark setting.'; $tn.Tag = 'muted'
+    $t3.Controls.Add($tn)
+
     $btns = New-Row
+    $btns.FlowDirection = 'RightToLeft'
     $ok = New-Button 'Save'; $ok.DialogResult = 'OK'
     $cancel = New-Button 'Cancel'; $cancel.DialogResult = 'Cancel'
-    $btns.Controls.AddRange(@($ok, $cancel))
-    $t.Controls.Add($btns); $t.SetColumnSpan($btns, 2)
-    $dlg.Controls.Add($t)
+    $btns.Controls.AddRange(@($cancel, $ok))
+    Add-StackRow $outer $st.Control -Fill
+    Add-StackRow $outer $btns
     $dlg.AcceptButton = $ok; $dlg.CancelButton = $cancel
+    Set-WindowTheme $dlg
+
     if ($dlg.ShowDialog($form) -eq 'OK') {
-        $settings.TvdbApiKey = $txtKey.Text.Trim()
+        $settings.TvdbApiKey = $txtTvdb.Text.Trim()
         $settings.TvdbPin = $txtPin.Text.Trim()
         $settings.TmdbKey = $txtTmdb.Text.Trim()
+        foreach ($key in @($script:SetBoxes.Keys)) { $settings[$key] = $script:SetBoxes[$key].Text.Trim() }
+        $settings.ArrSync = $chkSync.Checked
+        $themeChanged = $settings.Theme -ne [string]$cboTheme.SelectedItem
+        $settings.Theme = [string]$cboTheme.SelectedItem
         $script:TvdbToken = $null
         Save-Settings $settings
+        if ($themeChanged) { Set-AppTheme }
     }
     $dlg.Dispose()
+}
+
+# ---------------------------------------------------------------- theme (light / dark)
+
+function Test-SystemDark {
+    try { (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize' -Name AppsUseLightTheme -ErrorAction Stop).AppsUseLightTheme -eq 0 } catch { $false }
+}
+
+function Get-Palette([bool]$Dark) {
+    $c = { param($r, $g, $b) [Drawing.Color]::FromArgb($r, $g, $b) }
+    if ($Dark) {
+        @{ Dark = $true; Back = (& $c 30 32 38); Surface = (& $c 40 43 51); Input = (& $c 24 26 31); Text = (& $c 230 232 238)
+            Muted = (& $c 150 157 172); Border = (& $c 62 67 79); Accent = (& $c 107 155 255); Sel = (& $c 45 74 140)
+            Ok = (& $c 74 222 128); Bad = (& $c 248 113 113); Dim = (& $c 138 145 160); Child = (& $c 170 177 190) }
+    } else {
+        @{ Dark = $false; Back = [Drawing.SystemColors]::Control; Surface = [Drawing.SystemColors]::ControlLight; Input = [Drawing.SystemColors]::Window
+            Text = [Drawing.SystemColors]::ControlText; Muted = [Drawing.Color]::DimGray; Border = [Drawing.SystemColors]::ControlDark
+            Accent = [Drawing.Color]::FromArgb(0, 102, 204); Sel = [Drawing.SystemColors]::Highlight
+            Ok = [Drawing.Color]::DarkGreen; Bad = [Drawing.Color]::Firebrick; Dim = [Drawing.Color]::Gray; Child = [Drawing.Color]::DimGray }
+    }
+}
+$script:Pal = Get-Palette $false
+
+function Set-TitleBarTheme($Window) {
+    try {
+        $v = if ($script:Pal.Dark) { 1 } else { 0 }
+        [void][Win32.Dwm]::DwmSetWindowAttribute($Window.Handle, 20, [ref]$v, 4)
+    } catch { }
+}
+
+function Set-GridTheme($G) {
+    $p = $script:Pal
+    $G.EnableHeadersVisualStyles = -not $p.Dark
+    $G.BackgroundColor = $p.Input
+    $G.GridColor = $p.Border
+    $G.DefaultCellStyle.BackColor = $p.Input
+    $G.DefaultCellStyle.ForeColor = $p.Text
+    $G.DefaultCellStyle.SelectionBackColor = $p.Sel
+    $G.DefaultCellStyle.SelectionForeColor = if ($p.Dark) { $p.Text } else { [Drawing.SystemColors]::HighlightText }
+    $G.ColumnHeadersDefaultCellStyle.BackColor = $p.Surface
+    $G.ColumnHeadersDefaultCellStyle.ForeColor = $p.Muted
+    $G.ColumnHeadersDefaultCellStyle.SelectionBackColor = $p.Surface
+    $G.BorderStyle = if ($p.Dark) { 'FixedSingle' } else { 'Fixed3D' }
+    foreach ($row in $G.Rows) {
+        if ($row.Tag -is [hashtable] -and $row.Tag.ContainsKey('Parent') -and -not $row.Tag.Parent) { $row.DefaultCellStyle.ForeColor = $p.Child }
+        $last = $row.Cells[$row.Cells.Count - 1]
+        Set-StatusColor $last "$($last.Value)"
+    }
+}
+
+function Set-ControlTheme($C) {
+    $p = $script:Pal
+    if ($C -is [Windows.Forms.DataGridView]) { Set-GridTheme $C; return }
+    if ($C -is [Windows.Forms.TextBox] -or $C -is [Windows.Forms.ListBox]) {
+        $C.BackColor = $p.Input; $C.ForeColor = $p.Text
+        if ($C -is [Windows.Forms.TextBox]) { $C.BorderStyle = if ($p.Dark) { 'FixedSingle' } else { 'Fixed3D' } }
+    } elseif ($C -is [Windows.Forms.ComboBox]) {
+        $C.FlatStyle = if ($p.Dark) { 'Flat' } else { 'Standard' }
+        $C.DrawMode = if ($p.Dark) { 'OwnerDrawFixed' } else { 'Normal' }
+        $C.BackColor = $p.Input; $C.ForeColor = $p.Text
+    } elseif ($C -is [Windows.Forms.Button] -and $C.Name -eq 'tabbtn') {
+        return   # styled by Update-TabHeader
+    } elseif ($C -is [Windows.Forms.Button]) {
+        if ($p.Dark) {
+            $C.FlatStyle = 'Flat'; $C.BackColor = $p.Surface; $C.ForeColor = $p.Text; $C.FlatAppearance.BorderColor = $p.Border
+        } else {
+            $C.FlatStyle = 'Standard'; $C.BackColor = [Drawing.SystemColors]::Control; $C.ForeColor = $p.Text; $C.UseVisualStyleBackColor = $true
+        }
+    } elseif ($C -is [Windows.Forms.LinkLabel]) {
+        $C.LinkColor = $p.Accent; $C.ActiveLinkColor = $p.Accent; $C.BackColor = $p.Back
+    } elseif ($C -is [Windows.Forms.TabControl]) {
+        # Flat button tabs have no light 3D frame around the page area.
+        $C.DrawMode = if ($p.Dark) { 'OwnerDrawFixed' } else { 'Normal' }
+        $C.Appearance = if ($p.Dark) { 'FlatButtons' } else { 'Normal' }
+        $C.Invalidate()
+    } elseif ($C -is [Windows.Forms.ProgressBar]) {
+    } else {
+        $C.BackColor = $p.Back
+        $C.ForeColor = if ($C -is [Windows.Forms.Label] -and $C.Tag -eq 'muted') { $p.Muted } else { $p.Text }
+    }
+    foreach ($child in $C.Controls) { Set-ControlTheme $child }
+    if ($C.Tag -and $C.Tag.PSObject.Properties['Header']) { Update-TabHeader $C.Tag }
+}
+
+# Theme a whole window (main form or a dialog), including its title bar.
+function Set-WindowTheme($Window) {
+    $Window.BackColor = $script:Pal.Back
+    $Window.ForeColor = $script:Pal.Text
+    foreach ($child in $Window.Controls) { Set-ControlTheme $child }
+    if ($Window.IsHandleCreated) { Set-TitleBarTheme $Window } else { $Window.Add_HandleCreated({ Set-TitleBarTheme $this }) }
+}
+
+function Set-AppTheme {
+    $dark = switch ($settings.Theme) { 'Dark' { $true } 'Light' { $false } default { Test-SystemDark } }
+    $script:Pal = Get-Palette $dark
+    Set-WindowTheme $form
+    $form.Refresh()
+}
+
+# Dark tab headers (owner-drawn only in dark mode; light mode keeps the normal Windows look).
+$script:DrawTab = {
+    param($sender, $e)
+    $p = $script:Pal
+    $selected = $sender.SelectedIndex -eq $e.Index
+    $back = if ($selected) { $p.Back } else { $p.Surface }
+    $brush = New-Object Drawing.SolidBrush $back
+    $e.Graphics.FillRectangle($brush, $e.Bounds)
+    $brush.Dispose()
+    $fore = if ($selected) { $p.Text } else { $p.Muted }
+    [Windows.Forms.TextRenderer]::DrawText($e.Graphics, $sender.TabPages[$e.Index].Text, $sender.Font, $e.Bounds, $fore,
+        [Windows.Forms.TextFormatFlags]::HorizontalCenter -bor [Windows.Forms.TextFormatFlags]::VerticalCenter)
 }
 
 function Start-UpdateCheck {
@@ -1007,6 +1309,7 @@ $txtFolder.Text = $settings.LastFolder
 $script:LibTabs['TV'].Txt.Text = $settings.TvRoot
 $script:LibTabs['Movie'].Txt.Text = $settings.MovieRoot
 $script:LibTabs['Movie'].MovieFolders.Checked = [bool]$settings.MovieFolders
+Set-AppTheme
 $script:Loading = $false
 Set-Status 'Pick a folder (or drag one in) to get started.'
 

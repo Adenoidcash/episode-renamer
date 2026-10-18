@@ -1,0 +1,32 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>episode-renamer</Name>
+  <Repository>ghcr.io/adenoidcash/episode-renamer:latest</Repository>
+  <Registry>https://github.com/Adenoidcash/episode-renamer/pkgs/container/episode-renamer</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/Adenoidcash/episode-renamer/issues</Support>
+  <Project>https://github.com/Adenoidcash/episode-renamer</Project>
+  <Overview>Renames TV episodes and movies into a clean Plex/Jellyfin layout - Show (Year)/Season 01/Show - S01E01 - Title.mkv and Movie (Year)/Movie (Year).mkv - using TVmaze, TheTVDB, TMDB, or your own Sonarr/Radarr. Previews every change, keeps Sonarr/Radarr in sync after renaming, and can undo a whole batch.&#xD;
+&#xD;
+Set "Media" to the share that holds your TV and Movies folders, then open the WebUI.</Overview>
+  <Category>MediaApp:Video Tools:</Category>
+  <WebUI>http://[IP]:[PORT:8080]/</WebUI>
+  <TemplateURL>https://raw.githubusercontent.com/Adenoidcash/episode-renamer/main/unraid/episode-renamer.xml</TemplateURL>
+  <Icon>https://raw.githubusercontent.com/Adenoidcash/episode-renamer/main/web/icon.png</Icon>
+  <ExtraParams/>
+  <PostArgs/>
+  <CPUset/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires/>
+  <Config Name="WebUI port" Target="8080" Default="8080" Mode="tcp" Description="Port for the web interface." Type="Port" Display="always" Required="true" Mask="false">8080</Config>
+  <Config Name="Media" Target="/media" Default="/mnt/user/" Mode="rw" Description="Folder that contains your TV and Movies folders (e.g. /mnt/user/ or /mnt/user/media/). The app can only see and rename things inside this folder." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/</Config>
+  <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/episode-renamer" Mode="rw" Description="Settings and undo history." Type="Path" Display="advanced" Required="true" Mask="false">/mnt/user/appdata/episode-renamer</Config>
+  <Config Name="PUID" Target="PUID" Default="99" Mode="" Description="User that owns renamed files (99 = nobody, the Unraid default)." Type="Variable" Display="advanced" Required="false" Mask="false">99</Config>
+  <Config Name="PGID" Target="PGID" Default="100" Mode="" Description="Group that owns renamed files (100 = users, the Unraid default)." Type="Variable" Display="advanced" Required="false" Mask="false">100</Config>
+  <Config Name="UMASK" Target="UMASK" Default="000" Mode="" Description="Permissions for created folders (000 matches Unraid shares)." Type="Variable" Display="advanced" Required="false" Mask="false">000</Config>
+  <Config Name="Web password" Target="WEB_PASSWORD" Default="" Mode="" Description="Optional. If set, the browser asks for this password (any user name)." Type="Variable" Display="always" Required="false" Mask="true"></Config>
+</Container>
