@@ -47,6 +47,12 @@ This writes `dist\EpisodeRenamer.exe` and `dist\EpisodeRenamer-1.0.0.zip`.
 - **Keep filename title** keeps the episode title that's already in the filename, e.g. `[Anime Time] One Piece - 0063 - A Promise Between Men!...`. It only looks the title up when the file has none.
 - **From source** always uses the online title.
 
+**Picking the right show:** if the folder path has a year in brackets, e.g. `One Piece (1999)`, the app picks the search result that first aired that year. Otherwise it opens the results list so you can check its pick.
+
+**Rename matching extras:** files next to a video that share its name get renamed with it. That covers `<video>.nfo`, `<video>-thumb.jpg` and `<video>.en.srt`, so Plex/Kodi metadata and subtitles stay paired. The Original name column shows `(+N extra)`; hover over it to see the files.
+
+**Updates:** when a newer release is on GitHub, a *"Version x.y.z is available"* link appears at the bottom of the window.
+
 ## Naming scheme tokens
 
 | Token | Example |

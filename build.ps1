@@ -1,9 +1,14 @@
 # Builds dist\EpisodeRenamer.exe (single file, no console) and dist\EpisodeRenamer-<version>.zip.
 # Requires the ps2exe module:  Install-Module ps2exe -Scope CurrentUser
-param([string]$Version = '1.0.0')
+# The version comes from $script:AppVersion in EpisodeRenamer.Core.ps1 unless -Version is given.
+param([string]$Version)
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+if (-not $Version) {
+    $m = Select-String -Path (Join-Path $root 'EpisodeRenamer.Core.ps1') -Pattern "AppVersion = '([\d.]+)'"
+    $Version = $m.Matches[0].Groups[1].Value
+}
 $dist = Join-Path $root 'dist'
 $build = Join-Path $root 'build'
 Remove-Item $dist, $build -Recurse -Force -ErrorAction SilentlyContinue

@@ -4,8 +4,12 @@
 Set-StrictMode -Off
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
+$script:AppVersion = '1.1.0'
+$script:RepoSlug = 'Adenoidcash/episode-renamer'
 $script:VideoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.ts', '.m2ts', '.webm', '.flv', '.mpg', '.mpeg')
 $script:SubExt = @('.srt', '.ass', '.ssa', '.sub', '.idx', '.vtt', '.sup')
+# Files that travel with a video when they share its name ("<video>.nfo", "<video>-thumb.jpg", "<video>.en.srt").
+$script:CompanionExt = @('.nfo', '.jpg', '.jpeg', '.png', '.tbn') + $script:SubExt
 $script:AppDir = Join-Path $env:APPDATA 'EpisodeRenamer'
 $script:DefaultScheme = '{show} - S{season:00}E{episode:00} - {title}'
 $script:TvdbToken = $null
@@ -23,6 +27,7 @@ function Get-Settings {
         MatchMode  = 'Auto'
         Numbering  = 'Auto'
         TitleMode  = 'File'
+        RenameExtras = $true
         Recurse    = $false
         LastFolder = ''
         TvdbApiKey = ''
@@ -270,6 +275,29 @@ function ConvertFrom-EpisodeFileName([string]$FileName) {
 }
 
 $script:JunkPattern = '(?i)\s*(?:[\[\(\{].*|\b(?:480p|576p|720p|1080p|2160p|4K|UHD|HDR|WEB(?:-?DL|-?Rip)?|BluRay|BDRip|BRRip|HDTV|DVDRip|x264|x265|H\s?26[45]|HEVC|AVC|AAC(?:\d(?:\s\d)?)?|DDP?(?:\d(?:\s\d)?)?|AC3|FLAC|Opus|10bit|8bit|NF|AMZN|CR|DSNP|HMAX|REPACK|PROPER|iNTERNAL|MULTi|DUAL)\b.*)$'
+
+# "X:\Plex\Anime\One Piece (1999)\Season 02" -> 1999 (the innermost "(year)" in the path), otherwise $null.
+function Get-YearHint([string]$Path) {
+    $m = [regex]::Matches($Path, '\(((?:19|20)\d\d)\)')
+    if ($m.Count -gt 0) { return [int]$m[$m.Count - 1].Groups[1].Value }
+    $null
+}
+
+# Other files next to a video that share its name. Remainder is what follows the video's base name.
+function Get-Companions([string]$VideoPath, [object[]]$DirFiles) {
+    $base = [IO.Path]::GetFileNameWithoutExtension($VideoPath)
+    foreach ($f in $DirFiles) {
+        $name = $f.Name
+        if ($name.Length -le $base.Length -or -not $name.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { continue }
+        $rest = $name.Substring($base.Length)
+        if ($rest[0] -ne '.' -and $rest[0] -ne '-') { continue }
+        $ext = $f.Extension.ToLower()
+        if ($script:CompanionExt -notcontains $ext) { continue }
+        # "-thumb.jpg", ".en.srt", ".nfo" - but not "<video>.part2.mkv"-style names with more words in them.
+        if ($rest -notmatch '^(?:-[A-Za-z]+|(?:\.[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?)?(?:\.(?:forced|sdh|cc|hi|default))*)\.[A-Za-z0-9]+$') { continue }
+        [pscustomobject]@{ Path = $f.FullName; Remainder = $rest; Target = $null }
+    }
+}
 
 # "Season 02" / "S2" folder -> 2, otherwise $null.
 function Get-FolderSeason([string]$Dir) {
