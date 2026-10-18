@@ -18,6 +18,13 @@ $script:SelectedShow = $null
 $script:Loading = $true
 
 $MatchModes = [ordered]@{ 'Auto' = 'Auto'; 'Season + Episode' = 'SeasonEpisode'; 'Absolute number' = 'Absolute' }
+$NumberingModes = [ordered]@{ 'Auto' = 'Auto'; 'From source' = 'Source'; 'From file / folder' = 'File' }
+$TitleModes = [ordered]@{ 'Keep filename title' = 'File'; 'From source' = 'Source' }
+
+function Select-ByValue($Combo, $Map, $Value, $Fallback) {
+    $label = ($Map.GetEnumerator() | Where-Object { $_.Value -eq $Value } | Select-Object -First 1).Key
+    $Combo.SelectedItem = if ($label) { $label } else { $Fallback }
+}
 
 # ---------------------------------------------------------------- control helpers
 
@@ -80,10 +87,15 @@ $row2 = New-Row
 $cboSource = New-Combo 120 @('TVmaze', 'TheTVDB')
 $cboOrder = New-Combo 100 @('Aired', 'DVD', 'Absolute')
 $txtLang = New-TextBox 50
-$cboMatch = New-Combo 140 @($MatchModes.Keys)
+$cboMatch = New-Combo 130 @($MatchModes.Keys)
+$cboNumbering = New-Combo 130 @($NumberingModes.Keys)
+$cboTitles = New-Combo 140 @($TitleModes.Keys)
 $btnSettings = New-Button 'Settings...'
 $row2.Controls.AddRange(@((New-Label 'Source:'), $cboSource, (New-Label 'Episode order:'), $cboOrder,
-        (New-Label 'Language (TVDB):'), $txtLang, (New-Label 'Match files by:'), $cboMatch, $btnSettings))
+        (New-Label 'Language (TVDB):'), $txtLang, $btnSettings))
+$row2b = New-Row
+$row2b.Controls.AddRange(@((New-Label 'Match files by:'), $cboMatch, (New-Label 'Numbering:'), $cboNumbering,
+        (New-Label 'Titles:'), $cboTitles))
 
 # Row 3: show search
 $row3 = New-Row
@@ -133,13 +145,15 @@ $btnRemove = New-Button 'Remove selected'
 $lblStatus = New-Label ''
 $row5.Controls.AddRange(@($btnPreview, $btnRename, $btnUndo, $btnAll, $btnNone, $btnRemove, $lblStatus))
 
-foreach ($r in @($row1, $row2, $row3, $row4)) { [void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize'))); $layout.Controls.Add($r) }
+foreach ($r in @($row1, $row2, $row2b, $row3, $row4)) { [void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize'))); $layout.Controls.Add($r) }
 [void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100))); $layout.Controls.Add($grid)
 [void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize'))); $layout.Controls.Add($row5)
 
 $tips = New-Object Windows.Forms.ToolTip
 $tips.SetToolTip($cboOrder, 'Aired = normal TV order. DVD/Absolute only differ on TheTVDB (TVmaze: Absolute = S01E<absolute>).')
 $tips.SetToolTip($cboMatch, 'Auto: use SxxExx when the file has it, otherwise treat the lone number (e.g. "- 063") as an absolute episode number.')
+$tips.SetToolTip($cboNumbering, 'Auto: use the source''s season/episode, unless it numbers seasons by year (TVmaze anime) - then use the file''s numbers and its "Season NN" folder.')
+$tips.SetToolTip($cboTitles, 'Keep filename title: keep the episode title already in the filename and only look it up when the file has none.')
 $tips.SetToolTip($txtShowName, 'The show name written into the new file names. Edit it if you want a different spelling.')
 
 # ---------------------------------------------------------------- logic
@@ -179,9 +193,10 @@ function Add-Files([string[]]$Paths, [string]$Root) {
         $ext = [IO.Path]::GetExtension($path).ToLower()
         if ($script:VideoExt -notcontains $ext -and $script:SubExt -notcontains $ext) { continue }
         $item = [pscustomobject]@{
-            FullPath = $path
-            Root     = if ($Root) { $Root } else { Split-Path $path -Parent }
-            Parsed   = ConvertFrom-EpisodeFileName ([IO.Path]::GetFileName($path))
+            FullPath     = $path
+            Root         = if ($Root) { $Root } else { Split-Path $path -Parent }
+            Parsed       = ConvertFrom-EpisodeFileName ([IO.Path]::GetFileName($path))
+            FolderSeason = Get-FolderSeason (Split-Path $path -Parent)
             Target   = $null
             Status   = ''
         }
@@ -267,6 +282,7 @@ function Update-Preview([switch]$Fetch) {
         if ($item.Parsed.Kind -eq 'None') { Set-RowState $row '' 'No episode number found'; continue }
         $found = @(Find-Episodes $item.Parsed $eps $mode)
         if ($found.Count -eq 0) { Set-RowState $row '' "Not found on $($script:SelectedShow.Source)"; continue }
+        $found = @(Resolve-EpisodeInfo $found $item.Parsed $item.FolderSeason $NumberingModes[[string]$cboNumbering.SelectedItem] $TitleModes[[string]$cboTitles.SelectedItem])
         $ctx = @{ Show = $txtShowName.Text; Episodes = $found; Year = $script:SelectedShow.Year; Original = [IO.Path]::GetFileNameWithoutExtension($item.FullPath) }
         $rel = Format-NewName $scheme $ctx $item.Parsed
         if (-not $rel) { Set-RowState $row '' 'Scheme gives an empty name'; continue }
@@ -422,6 +438,8 @@ $txtSearch.Add_KeyDown({ if ($_.KeyCode -eq 'Enter') { $_.SuppressKeyPress = $tr
 $cboOrder.Add_SelectedIndexChanged({ Invoke-Safe { Update-Preview -Fetch } })
 $txtLang.Add_Leave({ Invoke-Safe { Update-Preview -Fetch } })
 $cboMatch.Add_SelectedIndexChanged({ Invoke-Safe { Update-Preview } })
+$cboNumbering.Add_SelectedIndexChanged({ Invoke-Safe { Update-Preview } })
+$cboTitles.Add_SelectedIndexChanged({ Invoke-Safe { Update-Preview } })
 $txtScheme.Add_TextChanged({ Invoke-Safe { Update-Preview } })
 $txtShowName.Add_TextChanged({ Invoke-Safe { Update-Preview } })
 $btnResetScheme.Add_Click({ $txtScheme.Text = $script:DefaultScheme })
@@ -443,6 +461,8 @@ $form.Add_FormClosing({
         $settings.Order = [string]$cboOrder.SelectedItem
         $settings.Language = $txtLang.Text.Trim()
         $settings.MatchMode = $MatchModes[[string]$cboMatch.SelectedItem]
+        $settings.Numbering = $NumberingModes[[string]$cboNumbering.SelectedItem]
+        $settings.TitleMode = $TitleModes[[string]$cboTitles.SelectedItem]
         $settings.Recurse = $chkRecurse.Checked
         $settings.LastFolder = $txtFolder.Text.Trim()
         try { Save-Settings $settings } catch { }
@@ -454,8 +474,9 @@ $txtScheme.Text = if ($settings.Scheme) { $settings.Scheme } else { $script:Defa
 $cboSource.SelectedItem = if ($cboSource.Items -contains $settings.Source) { $settings.Source } else { 'TVmaze' }
 $cboOrder.SelectedItem = if ($cboOrder.Items -contains $settings.Order) { $settings.Order } else { 'Aired' }
 $txtLang.Text = $settings.Language
-$matchLabel = ($MatchModes.GetEnumerator() | Where-Object { $_.Value -eq $settings.MatchMode } | Select-Object -First 1).Key
-$cboMatch.SelectedItem = if ($matchLabel) { $matchLabel } else { 'Auto' }
+Select-ByValue $cboMatch $MatchModes $settings.MatchMode 'Auto'
+Select-ByValue $cboNumbering $NumberingModes $settings.Numbering 'Auto'
+Select-ByValue $cboTitles $TitleModes $settings.TitleMode 'Keep filename title'
 $chkRecurse.Checked = [bool]$settings.Recurse
 $txtFolder.Text = $settings.LastFolder
 $script:Loading = $false

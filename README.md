@@ -38,6 +38,15 @@ This writes `dist\EpisodeRenamer.exe` and `dist\EpisodeRenamer-1.0.0.zip`.
 - **Season + Episode** matches only on SxxExx.
 - **Absolute number** always matches on the episode number as an absolute count.
 
+**Numbering**
+- **Auto** uses the source's season and episode numbers. The exception is a source that numbers seasons by year (TVmaze does this for long anime: `S2001E11`). Then the app uses the file's own numbers and its `Season 02` folder instead, giving `S02E63`.
+- **From source** always uses the online numbering.
+- **From file / folder** always uses the numbers in the filename, plus the season from a `Season NN` folder when the filename has none.
+
+**Titles**
+- **Keep filename title** keeps the episode title that's already in the filename, e.g. `[Anime Time] One Piece - 0063 - A Promise Between Men!...`. It only looks the title up when the file has none.
+- **From source** always uses the online title.
+
 ## Naming scheme tokens
 
 | Token | Example |

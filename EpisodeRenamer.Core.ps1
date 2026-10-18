@@ -21,6 +21,8 @@ function Get-Settings {
         Order      = 'Aired'
         Language   = 'eng'
         MatchMode  = 'Auto'
+        Numbering  = 'Auto'
+        TitleMode  = 'File'
         Recurse    = $false
         LastFolder = ''
         TvdbApiKey = ''
@@ -204,16 +206,20 @@ function ConvertFrom-EpisodeFileName([string]$FileName) {
         if ($m.Success) { $suffix = $m.Value; $base = $base.Substring(0, $m.Index) }
     }
 
-    # Drop leading [Group] / (tag) blocks, then treat dots/underscores as spaces.
+    # Drop leading [Group] / (tag) blocks. Underscores are always separators; dots only when the
+    # name has no real spaces (scene style "Show.S01E01.Title"), so titles like "Men!." or "vs." survive.
     $s = $base
     while ($s -match '^\s*(\[[^\]]*\]|\([^)]*\)|\{[^}]*\})\s*') { $s = $s.Substring($matches[0].Length) }
-    $s = (($s -replace '[._]+', ' ') -replace '\s{2,}', ' ').Trim()
+    $s = $s -replace '_+', ' '
+    if (([regex]::Matches($s, ' ')).Count -lt 2) { $s = $s -replace '\.+', ' ' }
+    $s = ($s -replace '\s{2,}', ' ').Trim()
 
     $result = [pscustomobject]@{
         Kind      = 'None'      # SE (season+episode), Abs (single/absolute number), None
         Season    = $null
         Episodes  = @()
         ShowGuess = ''
+        Title     = ''          # episode title already in the filename, if any
         Ext       = $ext
         Suffix    = $suffix
     }
@@ -254,8 +260,23 @@ function ConvertFrom-EpisodeFileName([string]$FileName) {
         $guess = $guess -replace '[\s\-]+$', ''
         $guess = $guess -replace '\s*\(?(19|20)\d\d\)?$', ''
         $result.ShowGuess = $guess.Trim()
+
+        # Whatever follows the episode number, minus release junk, is the title.
+        $rest = $s.Substring($m.Index + $m.Length)
+        $rest = [regex]::Replace($rest, $script:JunkPattern, '')
+        $result.Title = ($rest -replace '^[\s\-:~|]+', '').Trim()
     }
     $result
+}
+
+$script:JunkPattern = '(?i)\s*(?:[\[\(\{].*|\b(?:480p|576p|720p|1080p|2160p|4K|UHD|HDR|WEB(?:-?DL|-?Rip)?|BluRay|BDRip|BRRip|HDTV|DVDRip|x264|x265|H\s?26[45]|HEVC|AVC|AAC(?:\d(?:\s\d)?)?|DDP?(?:\d(?:\s\d)?)?|AC3|FLAC|Opus|10bit|8bit|NF|AMZN|CR|DSNP|HMAX|REPACK|PROPER|iNTERNAL|MULTi|DUAL)\b.*)$'
+
+# "Season 02" / "S2" folder -> 2, otherwise $null.
+function Get-FolderSeason([string]$Dir) {
+    $leaf = Split-Path $Dir -Leaf
+    if ($leaf -match '^(?i)(?:season|series|s)[\s._-]*(\d{1,3})$') { return [int]$matches[1] }
+    if ($leaf -match '^(?i)specials$') { return 0 }
+    $null
 }
 
 # Show name from a folder like "One Piece\Season 02\" when the filename itself has none.
@@ -274,13 +295,38 @@ function Find-Episodes($Parsed, $Episodes, [string]$MatchMode) {
     if ($useSE) {
         if ($null -eq $Parsed.Season) { return @() }
         $found = @(foreach ($n in $Parsed.Episodes) { $Episodes | Where-Object { $_.Season -eq $Parsed.Season -and $_.Number -eq $n } | Select-Object -First 1 })
-        # Anime releases often label everything "S01Exxx" with absolute numbers; fall back to that.
-        if ($found.Count -eq 0 -and $MatchMode -eq 'Auto' -and $Parsed.Season -eq 1) {
+        # Anime is often numbered absolutely ("S01E063", or TheTVDB-style "S02E63" while TVmaze uses
+        # year seasons); when the season/episode pair doesn't exist, fall back to the absolute number.
+        if ($found.Count -eq 0 -and $MatchMode -eq 'Auto') {
             $found = @(foreach ($n in $Parsed.Episodes) { $Episodes | Where-Object { $_.Absolute -eq $n } | Select-Object -First 1 })
         }
         return $found
     }
     @(foreach ($n in $Parsed.Episodes) { $Episodes | Where-Object { $_.Absolute -eq $n } | Select-Object -First 1 })
+}
+
+# Decide the season/episode numbers and title that go into the new name.
+#   Numbering: Auto   - source numbers, unless the source uses years as seasons (TVmaze anime) and the
+#                       file or its "Season NN" folder gives a season; then use the file's numbers.
+#              Source - always the source's numbers.   File - always the file's / folder's numbers.
+#   TitleMode: File   - keep the title already in the filename, fall back to the source title.
+#              Source - always the source title.
+function Resolve-EpisodeInfo($Found, $Parsed, $FolderSeason, [string]$Numbering, [string]$TitleMode) {
+    $found = @($Found)
+    $fileSeason = if ($Parsed.Kind -eq 'SE') { $Parsed.Season } else { $FolderSeason }
+    $yearSeasons = @($found | Where-Object { $_.Season -ge 1900 }).Count -gt 0
+    $useFile = ($Numbering -eq 'File') -or ($Numbering -eq 'Auto' -and $yearSeasons -and $null -ne $fileSeason)
+    $title = if ($TitleMode -eq 'File' -and $Parsed.Title) { $Parsed.Title } else { $null }
+    for ($i = 0; $i -lt $found.Count; $i++) {
+        $e = $found[$i]
+        [pscustomobject]@{
+            Season   = if ($useFile -and $null -ne $fileSeason) { $fileSeason } else { $e.Season }
+            Number   = if ($useFile) { $Parsed.Episodes[[Math]::Min($i, $Parsed.Episodes.Count - 1)] } else { $e.Number }
+            Absolute = $e.Absolute
+            Title    = if ($title) { $title } else { $e.Title }
+            AirDate  = $e.AirDate
+        }
+    }
 }
 
 function Format-Num($Value, [string]$Spec) {
