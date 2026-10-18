@@ -578,7 +578,7 @@ function Update-Preview([switch]$Fetch) {
         $item = $row.Tag
         $item.Target = $null
         if ($item.Parsed.Kind -eq 'None') { Set-RowState $row '' 'No episode number found'; continue }
-        $found = @(Find-Episodes $item.Parsed $eps $mode)
+        $found = @(Find-Episodes $item.Parsed $eps $mode $item.FolderSeason)
         if ($found.Count -eq 0) { Set-RowState $row '' "Not found on $($script:SelectedShow.Source)"; continue }
         $found = @(Resolve-EpisodeInfo $found $item.Parsed $item.FolderSeason $numbering $titleMode)
         $ctx = @{ Show = $txtShowName.Text; Episodes = $found; Year = $script:SelectedShow.Year; Original = [IO.Path]::GetFileNameWithoutExtension($item.FullPath) }

@@ -5,13 +5,18 @@
 function Initialize-Core {
     Set-StrictMode -Off
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $script:AppVersion = '1.2.0'
+    $script:AppVersion = '1.2.1'
     $script:RepoSlug = 'Adenoidcash/episode-renamer'
     $script:VideoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.ts', '.m2ts', '.webm', '.flv', '.mpg', '.mpeg')
     $script:SubExt = @('.srt', '.ass', '.ssa', '.sub', '.idx', '.vtt', '.sup')
     # Files that travel with a video when they share its name ("<video>.nfo", "<video>-thumb.jpg", "<video>.en.srt").
     $script:CompanionExt = @('.nfo', '.jpg', '.jpeg', '.png', '.tbn') + $script:SubExt
-    $script:AppDir = Join-Path $env:APPDATA 'EpisodeRenamer'
+    # Settings + undo logs: %APPDATA%\EpisodeRenamer on Windows, ~/.config/episode-renamer on Linux,
+    # or wherever EPISODE_RENAMER_CONFIG points (the Docker image uses /config).
+    $script:AppDir = if ($env:EPISODE_RENAMER_CONFIG) { $env:EPISODE_RENAMER_CONFIG }
+    elseif ($env:APPDATA) { Join-Path $env:APPDATA 'EpisodeRenamer' }
+    else { Join-Path (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.config') 'episode-renamer' }
+    $script:Sep = [IO.Path]::DirectorySeparatorChar
     $script:DefaultScheme = '{show} - S{season:00}E{episode:00} - {title}'
     $script:TvdbToken = $null
     $script:LastTvmazeCall = [DateTime]::MinValue
@@ -59,7 +64,7 @@ function Save-Settings($Settings) {
 # ---------------------------------------------------------------- http
 
 function Invoke-Json {
-    param([string]$Url, [string]$Method = 'GET', $Body = $null, [hashtable]$Headers = @{})
+    param([string]$Url, [string]$Method = 'GET', $Body = $null, [hashtable]$Headers = @{}, [int]$MaxAttempts = 4)
     for ($attempt = 1; ; $attempt++) {
         # TVmaze allows ~20 calls per 10 seconds; space calls out so whole-library scans don't hit the limit.
         if ($Url -like 'https://api.tvmaze.com/*') {
@@ -91,10 +96,16 @@ function Invoke-Json {
             $eresp = $_.Exception.Response
             $code = if ($eresp) { [int]$eresp.StatusCode } else { 0 }
             # TVmaze rate-limits (429) and occasionally returns 502 or stalls; retry those a couple of times.
-            if ($attempt -lt 4 -and ($code -eq 429 -or $code -ge 500 -or $_.Exception.Status -eq 'Timeout')) { Start-Sleep -Seconds (2 * $attempt); continue }
+            if ($attempt -lt $MaxAttempts -and ($code -eq 429 -or $code -ge 500 -or $_.Exception.Status -eq 'Timeout')) { Start-Sleep -Seconds (2 * $attempt); continue }
+            # Plain-language message; never dump the server's HTML error page into a dialog.
+            $site = ([uri]$Url).Host
             $detail = ''
-            if ($eresp) { try { $detail = (New-Object IO.StreamReader($eresp.GetResponseStream())).ReadToEnd() } catch { } }
-            $ex = New-Object Exception("Request failed ($code): $Url`n$($_.Exception.Message) $detail")
+            if ($eresp) { try { $detail = (New-Object IO.StreamReader($eresp.GetResponseStream())).ReadToEnd().Trim() } catch { } }
+            if ($detail.StartsWith('<') -or $detail.Length -gt 300) { $detail = '' }
+            $msg = if ($code -eq 0) { "Couldn't reach $site. Check the internet connection. ($($_.Exception.Message))" }
+            elseif ($code -ge 500) { "$site is having problems right now (error $code). Try again in a few minutes." }
+            else { "$site returned error $code." + $(if ($detail) { " $detail" } else { '' }) }
+            $ex = New-Object Exception($msg)
             $ex.Data['StatusCode'] = $code
             throw $ex
         } finally {
@@ -105,8 +116,55 @@ function Invoke-Json {
 
 # ---------------------------------------------------------------- TVmaze (free, no key)
 
+# TVmaze's search fails (502) on some titles - "Arifureta: From Commonplace to World's Strongest" breaks on
+# "World's Strongest" - and finds nothing for others. Fall back to shorter forms of the title and rank what
+# comes back by how much of the full title each result shares.
 function Search-TVmaze([string]$Query) {
-    $r = Invoke-Json "https://api.tvmaze.com/search/shows?q=$([uri]::EscapeDataString($Query))"
+    $lastError = $null
+    $variants = @(Get-QueryVariants $Query)
+    for ($i = 0; $i -lt $variants.Count; $i++) {
+        try {
+            $r = @(Search-TVmazeOnce $variants[$i])
+        } catch {
+            $code = $_.Exception.Data['StatusCode']
+            if ($code -ge 500 -or $code -eq 0) { $lastError = $_.Exception; continue }
+            throw
+        }
+        if ($r.Count -eq 0) { continue }
+        if ($i -eq 0) { return $r }   # the full title worked; keep TVmaze's own ranking
+        return @($r | Sort-Object @{ e = { Get-TitleSimilarity $_.Name $Query }; Descending = $true }, @{ e = { [array]::IndexOf($r, $_) } })
+    }
+    if ($lastError) { throw $lastError }
+    @()
+}
+
+# "Arifureta - From Commonplace to World's Strongest" -> the full title, "Arifureta",
+# the title without punctuation, its first two words, its first word.
+function Get-QueryVariants([string]$Query) {
+    $q = $Query.Trim()
+    $plain = (($q -replace "['`]", '') -replace '[^\p{L}\p{N}]+', ' ').Trim()
+    $words = @($plain -split ' ' | Where-Object { $_ })
+    $list = @($q)
+    if ($q -match '^(.+?)\s*(?:\s-\s|:)') { $list += $matches[1].Trim() }
+    $list += $plain
+    if ($words.Count -gt 2) { $list += ($words[0..1] -join ' ') }
+    if ($words.Count -gt 1 -and $words[0].Length -ge 4) { $list += $words[0] }
+    $seen = @{}
+    foreach ($v in $list) { if ($v -and -not $seen.ContainsKey($v.ToLower())) { $seen[$v.ToLower()] = $true; $v } }
+}
+
+# Share of the query's words that appear in the name, minus a little for extra words in the name (0..1).
+function Get-TitleSimilarity([string]$Name, [string]$Query) {
+    $norm = { param($t) @((($t -replace "['`]", '').ToLower() -replace '[^\p{L}\p{N}]+', ' ').Trim() -split ' ' | Where-Object { $_ }) }
+    $n = & $norm $Name
+    $q = & $norm $Query
+    if ($q.Count -eq 0 -or $n.Count -eq 0) { return 0 }
+    $common = @($q | Where-Object { $n -contains $_ }).Count
+    ($common / $q.Count) - 0.01 * [Math]::Max(0, $n.Count - $common)
+}
+
+function Search-TVmazeOnce([string]$Query) {
+    $r = Invoke-Json "https://api.tvmaze.com/search/shows?q=$([uri]::EscapeDataString($Query))" -MaxAttempts 2
     foreach ($x in @($r)) {
         $s = $x.show
         $year = if ($s.premiered) { $s.premiered.Substring(0, 4) } else { '' }
@@ -262,7 +320,17 @@ function ConvertFrom-EpisodeFileName([string]$FileName) {
         $result.Kind = 'SE'
         $result.Season = [int]$m.Groups[1].Value
         $result.Episodes = $nums
-    } else {
+    }
+    if (-not $m.Success) {
+        # "Black Clover 2nd Season - 01", "Show Season 2 - 05", "Show S2 - 05": a season word, then the episode.
+        $m = [regex]::Match($s, '(?i)\b(?:(\d{1,2})(?:st|nd|rd|th)\s+season|season\s*(\d{1,2})|S(\d{1,2}))\b\s*[-:~]?\s*(?:E|EP|Episode)?\s*(\d{1,4})(?:v\d)?(?![\w)])')
+        if ($m.Success) {
+            $result.Kind = 'SE'
+            $result.Season = [int](@($m.Groups[1].Value, $m.Groups[2].Value, $m.Groups[3].Value) | Where-Object { $_ } | Select-Object -First 1)
+            $result.Episodes = @([int]$m.Groups[4].Value)
+        }
+    }
+    if (-not $m.Success) {
         $patterns = @(
             '(?i)\b(?:E|EP|Episode)\s?(\d{1,4})(?:v\d)?\b',
             '\s-\s(\d{1,4})(?:v\d)?(?!\w)',
@@ -338,8 +406,21 @@ function Get-FolderShowGuess([string]$Dir) {
 
 # ---------------------------------------------------------------- matching + naming
 
-function Find-Episodes($Parsed, $Episodes, [string]$MatchMode) {
+function Find-Episodes($Parsed, $Episodes, [string]$MatchMode, $FolderSeason = $null) {
     if ($Parsed.Kind -eq 'None') { return @() }
+    # A bare number inside a "Season 2" folder ("Season 2\Show - 01") usually means episode 1 of season 2,
+    # unless it falls inside that season's absolute range ("Season 2\Show - 173" for a season that runs
+    # 171-..., or One Piece "Season 02\0063") - then it's an absolute number and handled below.
+    if ($MatchMode -eq 'Auto' -and $Parsed.Kind -eq 'Abs' -and $null -ne $FolderSeason) {
+        $inSeason = @($Episodes | Where-Object { $_.Season -eq $FolderSeason })
+        $abs = @($inSeason | Where-Object { $_.Absolute } | ForEach-Object { [int]$_.Absolute })
+        $first = $Parsed.Episodes[0]
+        $looksAbsolute = $abs.Count -gt 0 -and $first -ge ($abs | Measure-Object -Minimum).Minimum -and $first -le ($abs | Measure-Object -Maximum).Maximum
+        if ($inSeason.Count -and -not $looksAbsolute) {
+            $found = @(foreach ($n in $Parsed.Episodes) { $inSeason | Where-Object { $_.Number -eq $n } | Select-Object -First 1 })
+            if ($found.Count -eq $Parsed.Episodes.Count) { return $found }
+        }
+    }
     $useSE = ($MatchMode -eq 'SeasonEpisode') -or ($MatchMode -eq 'Auto' -and $Parsed.Kind -eq 'SE')
     if ($useSE) {
         if ($null -eq $Parsed.Season) { return @() }
@@ -414,7 +495,7 @@ function Get-TokenValue([string]$Key, [string]$Spec, $Ctx) {
     $null
 }
 
-# Returns the new relative path (may include sub-folders if the scheme contains "\").
+# Returns the new relative path (may include sub-folders if the scheme contains "\" or "/").
 function Format-NewName([string]$Scheme, $Ctx, $Parsed) {
     $sb = New-Object Text.StringBuilder
     $last = 0
@@ -431,7 +512,7 @@ function Format-NewName([string]$Scheme, $Ctx, $Parsed) {
     } | Where-Object { $_ })
     if ($parts.Count -eq 0) { return $null }
     for ($i = 0; $i -lt $parts.Count - 1; $i++) { $parts[$i] = $parts[$i].TrimEnd('. ') }
-    ($parts -join '\') + $Parsed.Suffix + $Parsed.Ext
+    ($parts -join $script:Sep) + $Parsed.Suffix + $Parsed.Ext
 }
 
 # ---------------------------------------------------------------- file operations + undo
@@ -449,7 +530,7 @@ function Move-PathSafe([string]$From, [string]$To, [bool]$IsDir, $Log) {
     }
     if ([string]::Equals($From, $To, [StringComparison]::OrdinalIgnoreCase)) {
         # Case-only change: go through a temporary name, Windows won't do it in one step.
-        $tmp = $From.TrimEnd('\') + '.renaming-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+        $tmp = $From.TrimEnd('\', '/') + '.renaming-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
         if ($IsDir) { [IO.Directory]::Move($From, $tmp); [IO.Directory]::Move($tmp, $To) }
         else { [IO.File]::Move($From, $tmp); [IO.File]::Move($tmp, $To) }
     } else {
@@ -537,7 +618,7 @@ function Undo-LastRename {
                 $exists = if ($isDir) { [IO.Directory]::Exists($e.To) } else { [IO.File]::Exists($e.To) }
                 if (-not $exists) { throw "Missing: $($e.To)" }
                 if ([string]::Equals($e.From, $e.To, [StringComparison]::OrdinalIgnoreCase)) {
-                    $tmp = $e.To.TrimEnd('\') + '.renaming-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
+                    $tmp = $e.To.TrimEnd('\', '/') + '.renaming-' + [guid]::NewGuid().ToString('N').Substring(0, 8)
                     if ($isDir) { [IO.Directory]::Move($e.To, $tmp); [IO.Directory]::Move($tmp, $e.From) }
                     else { [IO.File]::Move($e.To, $tmp); [IO.File]::Move($tmp, $e.From) }
                 } else {
@@ -715,9 +796,9 @@ function Add-ShowPlanOps($Plan, $Episodes, $Ctx) {
                 $comps = @(Get-Companions $f.FullName $files | Where-Object { -not $claimed[$_.Path] })
                 foreach ($c in $comps) { $claimed[$c.Path] = $true }
             }
-            $rel = $f.FullName.Substring($showDir.Length).TrimStart('\')
+            $rel = $f.FullName.Substring($showDir.Length).TrimStart('\', '/')
             $parsed = ConvertFrom-EpisodeFileName $f.Name
-            $found = @(Find-Episodes $parsed $Episodes $Ctx.Match)
+            $found = @(Find-Episodes $parsed $Episodes $Ctx.Match $folderSeason)
             if ($found.Count -eq 0) {
                 $why = if ($parsed.Kind -eq 'None') { 'No episode number found' } else { "Not found on $($show.Source)" }
                 $rows.Add((New-PlanRow $rel '' $why)); continue
@@ -761,7 +842,7 @@ function Add-ShowPlanOps($Plan, $Episodes, $Ctx) {
         $claimedLeaf[$target] = $true
         $dirTarget[$d] = $target
         $ops.Add((New-Op 'MoveDir' (Convert-Prefix $d $showDir $newShowDir) (Join-Path $newShowDir $target)))
-        $rows.Add((New-PlanRow "$leaf\" "$target\" 'Rename folder'))
+        $rows.Add((New-PlanRow "$leaf$script:Sep" "$target$script:Sep" 'Rename folder'))
     }
 
     # 4. Episode files (and their extras) -> Season NN\<scheme>.
@@ -774,7 +855,7 @@ function Add-ShowPlanOps($Plan, $Episodes, $Ctx) {
                 if ($cc -cne $c.Target) { New-Op 'MoveFile' $cc $c.Target }
             })
         if ($cur -ceq $e.Final -and $compMoves.Count -eq 0) { continue }
-        $newRel = $e.Final.Substring($newShowDir.Length).TrimStart('\')
+        $newRel = $e.Final.Substring($newShowDir.Length).TrimStart('\', '/')
         if ($finals[$e.Final]) { $rows.Add((New-PlanRow $e.Rel $newRel 'Duplicate new name')); continue }
         $finals[$e.Final] = $true
         $orig = Get-OriginalPath $e.Final $showDir $dirTarget
@@ -911,19 +992,19 @@ function Add-MoviePlanOps($Plan, $Ctx) {
         $folderNew = $item.Path
         if ($newDir -cne $item.Path) {
             if (-not [string]::Equals($newDir, $item.Path, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $newDir)) {
-                $rows.Add((New-PlanRow "$(Split-Path $item.Path -Leaf)\" "$newLeaf\" 'Folder name taken'))
+                $rows.Add((New-PlanRow "$(Split-Path $item.Path -Leaf)$script:Sep" "$newLeaf$script:Sep" 'Folder name taken'))
             } else {
                 $ops.Add((New-Op 'MoveDir' $item.Path $newDir))
                 $folderNew = $newDir
             }
         }
-        $Plan.NewName = if ($ops.Count) { "$(Split-Path $folderNew -Leaf)\$newLeaf$ext" } else { '' }
+        $Plan.NewName = if ($ops.Count) { "$(Split-Path $folderNew -Leaf)$script:Sep$newLeaf$ext" } else { '' }
     } else {
         $destDir = if ($Ctx.MovieFolders) { Join-Path $item.Root $newLeaf } else { $item.Root }
         $newMain = Join-Path $destDir ($newLeaf + $ext)
         if ($newMain -cne $item.Main) {
             if ([IO.File]::Exists($newMain) -and -not [string]::Equals($newMain, $item.Main, [StringComparison]::OrdinalIgnoreCase)) {
-                $rows.Add((New-PlanRow (Split-Path $item.Main -Leaf) $newMain.Substring($item.Root.Length).TrimStart('\') 'Name already taken'))
+                $rows.Add((New-PlanRow (Split-Path $item.Main -Leaf) $newMain.Substring($item.Root.Length).TrimStart('\', '/') 'Name already taken'))
             } elseif ([IO.File]::Exists($destDir)) {
                 $rows.Add((New-PlanRow (Split-Path $item.Main -Leaf) '' "A file named '$newLeaf' is in the way"))
             } else {
@@ -931,9 +1012,9 @@ function Add-MoviePlanOps($Plan, $Ctx) {
                 foreach ($c in $comps) {
                     $t = Join-Path $destDir ($newLeaf + $c.Remainder)
                     $ops.Add((New-Op 'MoveFile' $c.Path $t))
-                    $rows.Add((New-PlanRow ('+ ' + (Split-Path $c.Path -Leaf)) $t.Substring($item.Root.Length).TrimStart('\') 'Ready'))
+                    $rows.Add((New-PlanRow ('+ ' + (Split-Path $c.Path -Leaf)) $t.Substring($item.Root.Length).TrimStart('\', '/') 'Ready'))
                 }
-                $Plan.NewName = $newMain.Substring($item.Root.Length).TrimStart('\')
+                $Plan.NewName = $newMain.Substring($item.Root.Length).TrimStart('\', '/')
             }
         }
     }
