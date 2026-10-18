@@ -5,7 +5,7 @@
 function Initialize-Core {
     Set-StrictMode -Off
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    $script:AppVersion = '1.3.0'
+    $script:AppVersion = '1.3.1'
     $script:RepoSlug = 'Adenoidcash/episode-renamer'
     $script:VideoExt = @('.mkv', '.mp4', '.avi', '.m4v', '.mov', '.wmv', '.ts', '.m2ts', '.webm', '.flv', '.mpg', '.mpeg')
     $script:SubExt = @('.srt', '.ass', '.ssa', '.sub', '.idx', '.vtt', '.sup')
@@ -53,6 +53,7 @@ function Get-Settings {
         JellyfinKey = ''
         ArrSync    = $true
         Theme      = 'System'
+        OnlyChanges = $true
         TvRoot     = ''
         MovieRoot  = ''
         MovieFolders = $true
@@ -199,14 +200,16 @@ function Get-TVmazeEpisodes($Id, [string]$Order) {
     $eps = foreach ($e in @($raw)) {
         $isSpecial = ($e.type -ne 'regular') -or ($null -eq $e.number)
         [pscustomobject]@{
-            Season   = if ($isSpecial) { 0 } else { [int]$e.season }
-            Number   = if ($isSpecial) { $null } else { [int]$e.number }
-            Absolute = $null
-            Title    = $e.name
-            AirDate  = $e.airdate
+            Season        = if ($isSpecial) { 0 } else { [int]$e.season }
+            Number        = if ($isSpecial) { $null } else { [int]$e.number }
+            Absolute      = $null
+            Title         = $e.name
+            AirDate       = $e.airdate
+            NumberGuessed = $isSpecial
         }
     }
-    # TVmaze lists specials without a number; number them per show in air order so S00Exx can still match.
+    # TVmaze lists specials without a number. Give them a placeholder in air order so they can be looked up,
+    # but NumberGuessed marks it: these must never end up in a file name (Plex/Sonarr number specials differently).
     $sp = 0
     foreach ($e in @($eps | Where-Object { $_.Season -eq 0 })) { $sp++; $e.Number = $sp }
     $eps = Complete-AbsoluteNumbers $eps
@@ -319,6 +322,7 @@ function ConvertFrom-EpisodeFileName([string]$FileName) {
         Episodes  = @()
         ShowGuess = ''
         Title     = ''          # episode title already in the filename, if any
+        Clean     = $s          # cleaned-up name, for matching files that have no episode number
         Ext       = $ext
         Suffix    = $suffix
     }
@@ -420,33 +424,100 @@ function Get-FolderShowGuess([string]$Dir) {
 
 # ---------------------------------------------------------------- matching + naming
 
-function Find-Episodes($Parsed, $Episodes, [string]$MatchMode, $FolderSeason = $null) {
-    if ($Parsed.Kind -eq 'None') { return @() }
+function Get-TitleWords([string]$Text) {
+    @((($Text -replace "['`]", '').ToLower() -replace '[^\p{L}\p{N}]+', ' ').Trim() -split ' ' | Where-Object { $_ })
+}
+
+# Lookup tables for one episode list, built once and reused while the same list is passed in (a show
+# with 600+ episodes and 150+ files would otherwise be scanned in full for every single file).
+function Get-EpisodeIndex($Episodes) {
+    if ($null -ne $script:EpIndexSource -and [object]::ReferenceEquals($Episodes, $script:EpIndexSource)) { return $script:EpIndex }
+    $se = @{}; $abs = @{}; $seasons = @{}; $titles = New-Object System.Collections.Generic.List[object]
+    foreach ($e in @($Episodes)) {
+        $k = "$($e.Season)|$($e.Number)"
+        if (-not $se.ContainsKey($k)) { $se[$k] = $e }
+        if ($e.Absolute) { $a = [int]$e.Absolute; if (-not $abs.ContainsKey($a)) { $abs[$a] = $e } }
+        $s = [int]$e.Season
+        if (-not $seasons.ContainsKey($s)) { $seasons[$s] = New-Object System.Collections.Generic.List[object] }
+        $seasons[$s].Add($e)
+        if ($e.Title) { $w = @(Get-TitleWords $e.Title); if ($w.Count) { $titles.Add([pscustomobject]@{ E = $e; Key = ($w -join ' '); Words = $w }) } }
+    }
+    $script:EpIndexSource = $Episodes
+    $script:EpIndex = @{ SE = $se; Abs = $abs; Seasons = $seasons; Titles = $titles.ToArray() }
+    $script:EpIndex
+}
+
+# Match a file to an episode by its title ("Season 00\Balloons.mkv", "S00E108 - It's a SpongeBob Christmas").
+# Exact title first; otherwise the closest title that shares at least 80% of its words with the file's.
+function Find-EpisodeByTitle([string]$Text, $Index, $Season, [string]$ShowName) {
+    $words = @(Get-TitleWords $Text)
+    # Drop a leading show name ("SpongeBob SquarePants - Balloons" -> "balloons").
+    $show = @(Get-TitleWords $ShowName)
+    if ($show.Count -and $words.Count -gt $show.Count -and (($words[0..($show.Count - 1)]) -join ' ') -eq ($show -join ' ')) {
+        $words = @($words[$show.Count..($words.Count - 1)])
+    }
+    if ($words.Count -eq 0) { return $null }
+    $key = $words -join ' '
+    $pool = @($Index.Titles | Where-Object { $null -eq $Season -or $_.E.Season -eq $Season })
+    $exact = $pool | Where-Object { $_.Key -eq $key } | Select-Object -First 1
+    if ($exact) { return $exact.E }
+    $best = $null; $bestScore = 0
+    foreach ($t in $pool) {
+        $common = @($t.Words | Where-Object { $words -contains $_ }).Count
+        $score = $common / [Math]::Max($t.Words.Count, $words.Count)
+        if ($score -gt $bestScore) { $best = $t.E; $bestScore = $score }
+    }
+    if ($bestScore -ge 0.8) { return $best }
+    $null
+}
+
+function Find-Episodes($Parsed, $Episodes, [string]$MatchMode, $FolderSeason = $null, [string]$ShowName = '') {
+    $idx = Get-EpisodeIndex $Episodes
+
+    # Specials (S00 / "Specials" / "Season 00" folder) and files with no number at all are matched by
+    # title: special numbering differs between sources, and TVmaze doesn't number specials at all.
+    $special = ($Parsed.Kind -eq 'SE' -and $Parsed.Season -eq 0) -or ($Parsed.Kind -ne 'SE' -and $FolderSeason -eq 0)
+    if ($special -or $Parsed.Kind -eq 'None') {
+        $text = if ($Parsed.Kind -eq 'None') { $Parsed.Clean } else { $Parsed.Title }
+        $season = if ($special) { 0 } elseif ($null -ne $FolderSeason) { [int]$FolderSeason } else { $null }
+        if ($text) {
+            $m = Find-EpisodeByTitle $text $idx $season $ShowName
+            if (-not $m -and $null -ne $season -and -not $special) { $m = Find-EpisodeByTitle $text $idx $null $ShowName }
+            if ($m) { return @($m) }
+        }
+        if ($Parsed.Kind -eq 'None') { return @() }
+        if ($special) {
+            # No title to go on: trust "S00E05" only if the source really numbers its specials.
+            $found = @(foreach ($n in $Parsed.Episodes) { $e = $idx.SE["0|$n"]; if ($e -and -not $e.NumberGuessed) { $e } })
+            return $(if ($found.Count -eq $Parsed.Episodes.Count) { $found } else { @() })
+        }
+    }
+
     # A bare number inside a "Season 2" folder ("Season 2\Show - 01") usually means episode 1 of season 2,
     # unless it falls inside that season's absolute range ("Season 2\Show - 173" for a season that runs
     # 171-..., or One Piece "Season 02\0063") - then it's an absolute number and handled below.
-    if ($MatchMode -eq 'Auto' -and $Parsed.Kind -eq 'Abs' -and $null -ne $FolderSeason) {
-        $inSeason = @($Episodes | Where-Object { $_.Season -eq $FolderSeason })
+    if ($MatchMode -eq 'Auto' -and $Parsed.Kind -eq 'Abs' -and $null -ne $FolderSeason -and $idx.Seasons.ContainsKey([int]$FolderSeason)) {
+        $inSeason = $idx.Seasons[[int]$FolderSeason]
         $abs = @($inSeason | Where-Object { $_.Absolute } | ForEach-Object { [int]$_.Absolute })
         $first = $Parsed.Episodes[0]
         $looksAbsolute = $abs.Count -gt 0 -and $first -ge ($abs | Measure-Object -Minimum).Minimum -and $first -le ($abs | Measure-Object -Maximum).Maximum
-        if ($inSeason.Count -and -not $looksAbsolute) {
-            $found = @(foreach ($n in $Parsed.Episodes) { $inSeason | Where-Object { $_.Number -eq $n } | Select-Object -First 1 })
+        if (-not $looksAbsolute) {
+            $found = @(@(foreach ($n in $Parsed.Episodes) { $idx.SE["$([int]$FolderSeason)|$n"] }) | Where-Object { $_ })
             if ($found.Count -eq $Parsed.Episodes.Count) { return $found }
         }
     }
     $useSE = ($MatchMode -eq 'SeasonEpisode') -or ($MatchMode -eq 'Auto' -and $Parsed.Kind -eq 'SE')
     if ($useSE) {
         if ($null -eq $Parsed.Season) { return @() }
-        $found = @(foreach ($n in $Parsed.Episodes) { $Episodes | Where-Object { $_.Season -eq $Parsed.Season -and $_.Number -eq $n } | Select-Object -First 1 })
+        $found = @(@(foreach ($n in $Parsed.Episodes) { $idx.SE["$($Parsed.Season)|$n"] }) | Where-Object { $_ })
         # Anime is often numbered absolutely ("S01E063", or TheTVDB-style "S02E63" while TVmaze uses
         # year seasons); when the season/episode pair doesn't exist, fall back to the absolute number.
-        if ($found.Count -eq 0 -and $MatchMode -eq 'Auto') {
-            $found = @(foreach ($n in $Parsed.Episodes) { $Episodes | Where-Object { $_.Absolute -eq $n } | Select-Object -First 1 })
+        if ($found.Count -eq 0 -and $MatchMode -eq 'Auto' -and $Parsed.Season -ne 0) {
+            $found = @(@(foreach ($n in $Parsed.Episodes) { $idx.Abs[[int]$n] }) | Where-Object { $_ })
         }
         return $found
     }
-    @(foreach ($n in $Parsed.Episodes) { $Episodes | Where-Object { $_.Absolute -eq $n } | Select-Object -First 1 })
+    @(@(foreach ($n in $Parsed.Episodes) { $idx.Abs[[int]$n] }) | Where-Object { $_ })
 }
 
 # Decide the season/episode numbers and title that go into the new name.
@@ -463,14 +534,26 @@ function Resolve-EpisodeInfo($Found, $Parsed, $FolderSeason, [string]$Numbering,
     $title = if ($TitleMode -eq 'File' -and $Parsed.Title) { $Parsed.Title } else { $null }
     for ($i = 0; $i -lt $found.Count; $i++) {
         $e = $found[$i]
+        $fileNumber = if ($Parsed.Kind -ne 'None') { $Parsed.Episodes[[Math]::Min($i, $Parsed.Episodes.Count - 1)] } else { $null }
+        $number = if ($useFile) { $fileNumber } else { $e.Number }
+        $season = if ($useFile -and $null -ne $fileSeason) { $fileSeason } else { $e.Season }
+        # A placeholder number (TVmaze special) never goes into a name: keep the file's own, or flag it.
+        if ($e.NumberGuessed) { $number = if ($Parsed.Kind -eq 'SE') { $fileNumber } else { $null }; $season = 0 }
         [pscustomobject]@{
-            Season   = if ($useFile -and $null -ne $fileSeason) { $fileSeason } else { $e.Season }
-            Number   = if ($useFile) { $Parsed.Episodes[[Math]::Min($i, $Parsed.Episodes.Count - 1)] } else { $e.Number }
-            Absolute = $e.Absolute
-            Title    = if ($title) { $title } else { $e.Title }
-            AirDate  = $e.AirDate
+            Season      = $season
+            Number      = $number
+            Absolute    = $e.Absolute
+            Title       = if ($title) { $title } else { $e.Title }
+            AirDate     = $e.AirDate
+            NeedsNumber = ($null -eq $number)
         }
     }
+}
+
+# Status text for a file whose special was found but can't be numbered from this source.
+function Get-NeedsNumberText($Resolved, [string]$Source) {
+    $t = @($Resolved)[0].Title
+    "Special '$t' found, but $Source doesn't number specials - use TheTVDB or Sonarr as the TV source"
 }
 
 function Format-Num($Value, [string]$Spec) {
@@ -1030,12 +1113,13 @@ function Add-ShowPlanOps($Plan, $Episodes, $Ctx) {
             }
             $rel = $f.FullName.Substring($showDir.Length).TrimStart('\', '/')
             $parsed = ConvertFrom-EpisodeFileName $f.Name
-            $found = @(Find-Episodes $parsed $Episodes $Ctx.Match $folderSeason)
+            $found = @(Find-Episodes $parsed $Episodes $Ctx.Match $folderSeason $show.Name)
             if ($found.Count -eq 0) {
-                $why = if ($parsed.Kind -eq 'None') { 'No episode number found' } else { "Not found on $($show.Source)" }
+                $why = if ($parsed.Kind -eq 'None') { "No episode number, and no $($show.Source) episode with that title" } else { "Not found on $($show.Source)" }
                 $rows.Add((New-PlanRow $rel '' $why)); continue
             }
             $res = @(Resolve-EpisodeInfo $found $parsed $folderSeason $Ctx.Numbering $Ctx.TitleMode)
+            if (@($res | Where-Object { $_.NeedsNumber }).Count) { $rows.Add((New-PlanRow $rel '' (Get-NeedsNumberText $res $show.Source))); continue }
             $season = $res[0].Season
             if ($season -ge 1900) {
                 $rows.Add((New-PlanRow $rel '' "Season unknown - $($show.Source) numbers this show by year (put it in a Season folder or use TheTVDB)")); continue

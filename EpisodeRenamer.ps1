@@ -277,7 +277,8 @@ $btnRename.Font = $script:BoldFont
 $btnAll = New-Button 'Check all'
 $btnNone = New-Button 'Check none'
 $btnRemove = New-Button 'Remove selected'
-$rowEpButtons.Controls.AddRange(@($btnPreview, $btnRename, $btnAll, $btnNone, $btnRemove))
+$chkOnlyChanges = New-CheckBox 'Only show files that change'
+$rowEpButtons.Controls.AddRange(@($btnPreview, $btnRename, $btnAll, $btnNone, $btnRemove, $chkOnlyChanges))
 
 Add-StackRow $stackEp $rowFolder
 Add-StackRow $stackEp $rowShow
@@ -310,7 +311,8 @@ function New-LibraryTab([string]$Kind, [string]$Title, [string]$Hint) {
     $btnAll = New-Button 'Check all'; $btnAll.Tag = $Kind
     $btnNone = New-Button 'Check none'; $btnNone.Tag = $Kind
     $chkDetails = New-CheckBox 'Show file details'; $chkDetails.Tag = $Kind; $chkDetails.Checked = $true
-    $rowB.Controls.AddRange(@($btnRen, $btnMatch, $btnAll, $btnNone, $chkDetails))
+    $chkOnly = New-CheckBox 'Only show changes'; $chkOnly.Tag = $Kind; $chkOnly.Checked = $true
+    $rowB.Controls.AddRange(@($btnRen, $btnMatch, $btnAll, $btnNone, $chkDetails, $chkOnly))
     $chkFolders = $null
     if ($Kind -eq 'Movie') {
         $chkFolders = New-CheckBox 'Put loose movies in their own folder'; $chkFolders.Tag = $Kind
@@ -337,7 +339,12 @@ function New-LibraryTab([string]$Kind, [string]$Title, [string]$Hint) {
     $chkDetails.Add_CheckedChanged({
             $gr = $script:LibTabs[$this.Tag].Grid
             $gr.CurrentCell = $null
-            foreach ($r in $gr.Rows) { if (-not $r.Tag.Parent) { $r.Visible = $this.Checked } }
+            foreach ($r in $gr.Rows) { if (-not $r.Tag.Parent) { $r.Visible = $this.Checked -and $r.Tag.Wanted } }
+        })
+    $chkOnly.Add_CheckedChanged({
+            if ($script:Loading) { return }
+            $settings.OnlyChanges = $this.Checked
+            Show-LibraryPlans $script:LibTabs[$this.Tag]
         })
     $g.Add_CellDoubleClick({ if ($_.RowIndex -ge 0) { $st = $script:LibTabs[$this.Tag]; Invoke-Safe { Show-ChangeMatch $st } } })
     if ($chkFolders) {
@@ -347,7 +354,7 @@ function New-LibraryTab([string]$Kind, [string]$Title, [string]$Hint) {
             })
     }
 
-    [pscustomobject]@{ Kind = $Kind; Page = $page; Txt = $txt; Grid = $g; Plans = @(); Details = $chkDetails; MovieFolders = $chkFolders }
+    [pscustomobject]@{ Kind = $Kind; Page = $page; Txt = $txt; Grid = $g; Plans = @(); Details = $chkDetails; OnlyChanges = $chkOnly; MovieFolders = $chkFolders }
 }
 
 $script:LibTabs['TV'] = New-LibraryTab 'TV' 'TV Library' 'Pick one show folder or a whole TV library. Show folders become "Show (Year)", season folders "Season 01", and episodes follow the name scheme above.'
@@ -624,12 +631,12 @@ function Get-CacheKey {
 
 function Request-Episodes {
     $show = $script:SelectedShow
-    $params = @{ Source = $show.Source; Id = $show.Id; Order = [string]$cboOrder.SelectedItem; Lang = $txtLang.Text.Trim()
-        Key = $settings.TvdbApiKey; Pin = $settings.TvdbPin; Token = $script:TvdbToken; CacheKey = (Get-CacheKey) }
+    $params = @{ Show = $show; Ctx = (Get-LookupContext); Token = $script:TvdbToken; CacheKey = (Get-CacheKey) }
     [void](Start-Background "Downloading episode list for $($show.Name)..." {
-            param($Source, $Id, $Order, $Lang, $Key, $Pin, $Token, $CacheKey)
+            param($Show, $Ctx, $Token, $CacheKey)
             $script:TvdbToken = $Token
-            if ($Source -eq 'TheTVDB') { Connect-Tvdb $Key $Pin; $e = @(Get-TvdbEpisodes $Id $Order $Lang) } else { $e = @(Get-TVmazeEpisodes $Id $Order) }
+            # Same lookup as the TV Library tab: TVmaze, TheTVDB or Sonarr, depending on where the show came from.
+            $e = @(Get-ShowEpisodes $Show $Ctx)
             @{ Episodes = $e; CacheKey = $CacheKey; Token = $script:TvdbToken }
         } $params {
             param($o)
@@ -678,13 +685,18 @@ function Update-Preview([switch]$Fetch) {
     $numbering = $NumberingModes[[string]$cboNumbering.SelectedItem]
     $titleMode = $TitleModes[[string]$cboTitles.SelectedItem]
     $hasFolders = $scheme -match '[\\/]'
+    $src = $script:SelectedShow.Source
+    $grid.SuspendLayout()
     foreach ($row in $grid.Rows) {
         $item = $row.Tag
         $item.Target = $null
-        if ($item.Parsed.Kind -eq 'None') { Set-RowState $row '' 'No episode number found'; continue }
-        $found = @(Find-Episodes $item.Parsed $eps $mode $item.FolderSeason)
-        if ($found.Count -eq 0) { Set-RowState $row '' "Not found on $($script:SelectedShow.Source)"; continue }
+        $found = @(Find-Episodes $item.Parsed $eps $mode $item.FolderSeason $script:SelectedShow.Name)
+        if ($found.Count -eq 0) {
+            $why = if ($item.Parsed.Kind -eq 'None') { "No episode number, and no $src episode with that title" } else { "Not found on $src" }
+            Set-RowState $row '' $why; continue
+        }
         $found = @(Resolve-EpisodeInfo $found $item.Parsed $item.FolderSeason $numbering $titleMode)
+        if (@($found | Where-Object { $_.NeedsNumber }).Count) { Set-RowState $row '' (Get-NeedsNumberText $found $src); continue }
         $ctx = @{ Show = $txtShowName.Text; Episodes = $found; Year = $script:SelectedShow.Year; Original = [IO.Path]::GetFileNameWithoutExtension($item.FullPath) }
         $rel = Format-NewName $scheme $ctx $item.Parsed
         if (-not $rel) { Set-RowState $row '' 'Scheme gives an empty name'; continue }
@@ -702,8 +714,38 @@ function Update-Preview([switch]$Fetch) {
     $groups = $grid.Rows | Where-Object { $_.Cells[0].Value -and $_.Tag.Status -eq 'Ready' } | Group-Object { $_.Tag.Target.ToLower() } | Where-Object { $_.Count -gt 1 }
     foreach ($g in $groups) { foreach ($row in $g.Group) { Set-RowState $row $row.Cells[3].Value 'Duplicate new name' } }
 
-    $ready = @($grid.Rows | Where-Object { $_.Cells[0].Value -and $_.Tag.Status -eq 'Ready' }).Count
-    if (-not (Test-Busy)) { Set-Status "$ready file(s) ready to rename." }
+    Update-EpisodeRowVisibility
+    $grid.ResumeLayout()
+    Update-ReadyCount
+}
+
+# "Only show files that change": hide files that are already correct or couldn't be matched.
+function Test-RowWanted([string]$Status) {
+    $Status -in @('Ready', 'Duplicate new name', 'Name already taken', 'Search for a show', '') -or $Status -like 'Renamed*' -or $Status -like 'Error*'
+}
+
+function Update-EpisodeRowVisibility {
+    $only = $chkOnlyChanges.Checked
+    $grid.CurrentCell = $null
+    $same = 0; $unmatched = 0
+    foreach ($row in $grid.Rows) {
+        $s = "$($row.Tag.Status)"
+        $show = (-not $only) -or (Test-RowWanted $s)
+        if (-not (Test-RowWanted $s)) { if ($s -eq 'Unchanged') { $same++ } else { $unmatched++ } }
+        if ($row.Visible -ne $show) { $row.Visible = $show }
+    }
+    $script:HiddenNote = ''
+    if ($same + $unmatched -gt 0) {
+        $what = (@($(if ($same) { "$same already correct" }), $(if ($unmatched) { "$unmatched not matched" })) | Where-Object { $_ }) -join ', '
+        $script:HiddenNote = if ($only) { "   Hidden: $what (untick ""Only show files that change"" to see them)." } else { "   ($what.)" }
+    }
+}
+
+# Cheap enough to run on every checkbox click (the full preview isn't).
+function Update-ReadyCount {
+    $ready = 0
+    foreach ($row in $grid.Rows) { if ($row.Cells[0].Value -and $row.Tag.Status -eq 'Ready') { $ready++ } }
+    if (-not (Test-Busy)) { Set-Status ("$ready file(s) ready to rename." + $script:HiddenNote) }
 }
 
 function Invoke-Rename {
@@ -796,31 +838,44 @@ function Get-MatchText($Plan) {
 
 function Show-LibraryPlans($St) {
     $g = $St.Grid
+    $only = $St.OnlyChanges.Checked
+    $g.SuspendLayout()
     $g.Rows.Clear()
     $plans = @($St.Plans)
+    $hiddenShows = 0; $hiddenFiles = 0
     for ($i = 0; $i -lt $plans.Count; $i++) {
         $p = $plans[$i]
         $canRun = @($p.Ops).Count -gt 0 -and $p.Status -notlike 'Error*'
+        # Hide what needs nothing; keep shows that need attention (not found, errors) visible.
+        if ($only -and -not $canRun -and $p.Status -like 'Up to date*') { $hiddenShows++; continue }
         $idx = $g.Rows.Add($canRun, $p.Label, $p.NewName, (Get-MatchText $p), $p.Status)
         $row = $g.Rows[$idx]
-        $row.Tag = @{ Plan = $p; Index = $i; Parent = $true }
+        $row.Tag = @{ Plan = $p; Index = $i; Parent = $true; Wanted = $true }
         $row.DefaultCellStyle.Font = $script:BoldFont
         $row.Cells[1].ToolTipText = $p.Dir
         Set-StatusColor $row.Cells[4] $p.Status
         foreach ($r in @($p.Rows)) {
+            $wanted = (-not $only) -or $r.Status -in @('Ready', 'Rename folder')
+            if (-not $wanted) { $hiddenFiles++ }
             $idx = $g.Rows.Add($null, ('      ' + $r.Current), ('      ' + $r.New), '', $r.Status)
             $child = $g.Rows[$idx]
             $child.Cells[0] = New-Object Windows.Forms.DataGridViewTextBoxCell
             $child.Cells[0].ReadOnly = $true
-            $child.Tag = @{ Plan = $p; Index = $i; Parent = $false }
+            $child.Tag = @{ Plan = $p; Index = $i; Parent = $false; Wanted = $wanted }
             $child.DefaultCellStyle.ForeColor = $script:Pal.Child
             Set-StatusColor $child.Cells[4] $r.Status
-            $child.Visible = $St.Details.Checked
+            $child.Visible = $St.Details.Checked -and $wanted
         }
     }
+    $g.ResumeLayout()
     $what = if ($St.Kind -eq 'TV') { 'show(s)' } else { 'movie(s)' }
     $ready = @($plans | Where-Object { @($_.Ops).Count -gt 0 -and $_.Status -notlike 'Error*' }).Count
-    Set-Status "$($plans.Count) $what found, $ready with changes to make."
+    $note = ''
+    if ($only -and ($hiddenShows + $hiddenFiles)) {
+        $parts = @($(if ($hiddenShows) { "$hiddenShows already up to date" }), $(if ($hiddenFiles) { "$hiddenFiles file(s) that won't change" })) | Where-Object { $_ }
+        $note = "   Hidden: $($parts -join ', ') (untick ""Only show changes"" to see them)."
+    }
+    Set-Status "$($plans.Count) $what found, $ready with changes to make.$note"
 }
 
 function Invoke-LibraryRename($St) {
@@ -1262,13 +1317,19 @@ $btnResetScheme.Add_Click({ $txtScheme.Text = $script:DefaultScheme })
 $btnSettings.Add_Click({ Show-SettingsDialog })
 $lnkUpdate.Add_LinkClicked({ if ($script:UpdateUrl) { Start-Process $script:UpdateUrl } })
 
-$grid.Add_CellValueChanged({ if ($_.ColumnIndex -eq 0) { Invoke-Safe { Update-Preview } } })
+$grid.Add_CellValueChanged({ if ($_.ColumnIndex -eq 0 -and -not $script:BulkCheck) { Update-ReadyCount } })
+$chkOnlyChanges.Add_CheckedChanged({
+        if ($script:Loading) { return }
+        $settings.OnlyChanges = $chkOnlyChanges.Checked
+        foreach ($st in $script:LibTabs.Values) { $st.OnlyChanges.Checked = $chkOnlyChanges.Checked }
+        Update-EpisodeRowVisibility; Update-ReadyCount
+    })
 
 $btnPreview.Add_Click({ Invoke-Safe { Update-Preview -Fetch } })
 $btnRename.Add_Click({ Invoke-Safe { Invoke-Rename } })
 $btnUndo.Add_Click({ Invoke-Safe { Invoke-Undo } })
-$btnAll.Add_Click({ foreach ($r in $grid.Rows) { $r.Cells[0].Value = $true } })
-$btnNone.Add_Click({ foreach ($r in $grid.Rows) { $r.Cells[0].Value = $false } })
+$btnAll.Add_Click({ $script:BulkCheck = $true; foreach ($r in $grid.Rows) { if ($r.Visible) { $r.Cells[0].Value = $true } }; $script:BulkCheck = $false; Update-ReadyCount })
+$btnNone.Add_Click({ $script:BulkCheck = $true; foreach ($r in $grid.Rows) { $r.Cells[0].Value = $false }; $script:BulkCheck = $false; Update-ReadyCount })
 $btnRemove.Add_Click({ foreach ($r in @($grid.SelectedRows)) { $grid.Rows.Remove($r) }; Invoke-Safe { Update-Preview } })
 
 $form.Add_Shown({ Start-UpdateCheck })
@@ -1286,6 +1347,7 @@ $form.Add_FormClosing({
         $settings.TvRoot = $script:LibTabs['TV'].Txt.Text.Trim()
         $settings.MovieRoot = $script:LibTabs['Movie'].Txt.Text.Trim()
         $settings.MovieFolders = $script:LibTabs['Movie'].MovieFolders.Checked
+        $settings.OnlyChanges = $chkOnlyChanges.Checked
         try { Save-Settings $settings } catch { }
         # Don't wait for running lookups (PowerShell.Stop() blocks until a web request returns); ask them
         # to stop and let the process exit below.
@@ -1309,6 +1371,8 @@ $txtFolder.Text = $settings.LastFolder
 $script:LibTabs['TV'].Txt.Text = $settings.TvRoot
 $script:LibTabs['Movie'].Txt.Text = $settings.MovieRoot
 $script:LibTabs['Movie'].MovieFolders.Checked = [bool]$settings.MovieFolders
+$chkOnlyChanges.Checked = [bool]$settings.OnlyChanges
+foreach ($st in $script:LibTabs.Values) { $st.OnlyChanges.Checked = [bool]$settings.OnlyChanges }
 Set-AppTheme
 $script:Loading = $false
 Set-Status 'Pick a folder (or drag one in) to get started.'

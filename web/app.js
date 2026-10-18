@@ -118,7 +118,11 @@ function render() {
   $('empty').hidden = has;
   if (!has) return;
 
+  const only = $('onlyChk').checked;
+  let hiddenShows = 0, hiddenFiles = 0;
   for (const p of plans) {
+    // Hide what needs nothing; shows that need attention (not found, errors) stay visible.
+    if (only && p.changes === 0 && /^Up to date/.test(p.status)) { hiddenShows++; continue; }
     const tr = document.createElement('tr');
     tr.className = 'parent';
     const tdUse = document.createElement('td');
@@ -157,6 +161,7 @@ function render() {
     tbody.appendChild(tr);
 
     for (const r of p.rows) {
+      if (only && !/^(Ready|Rename folder)/.test(r.status)) { hiddenFiles++; continue; }
       const c = document.createElement('tr');
       c.className = 'child';
       c.appendChild(document.createElement('td'));
@@ -168,6 +173,7 @@ function render() {
       tbody.appendChild(c);
     }
   }
+  state.hidden = { shows: hiddenShows, files: hiddenFiles };
   updateSummary();
 }
 
@@ -176,7 +182,9 @@ function updateSummary() {
   const ready = plans.filter((p) => p.changes > 0).length;
   const checked = state.checked[state.kind].size;
   const what = state.kind === 'TV' ? 'show' : 'movie';
-  $('summary').textContent = `${plans.length} ${what}${plans.length === 1 ? '' : 's'} \u00B7 ${ready} with changes \u00B7 ${checked} checked`;
+  const h = state.hidden || { shows: 0, files: 0 };
+  const hidden = h.shows + h.files ? ` \u00B7 hidden: ${[h.shows ? `${h.shows} up to date` : '', h.files ? `${h.files} unchanged file(s)` : ''].filter(Boolean).join(', ')}` : '';
+  $('summary').textContent = `${plans.length} ${what}${plans.length === 1 ? '' : 's'} \u00B7 ${ready} with changes \u00B7 ${checked} checked${hidden}`;
 }
 
 function switchTab(kind) {
@@ -430,6 +438,8 @@ $('checkAllBtn').addEventListener('click', () => {
 });
 $('checkNoneBtn').addEventListener('click', () => { state.checked[state.kind].clear(); render(); });
 $('detailsChk').addEventListener('change', (e) => $('results').classList.toggle('details-off', !e.target.checked));
+$('onlyChk').addEventListener('change', (e) => { try { localStorage.setItem('onlyChanges', e.target.checked ? '1' : '0'); } catch (err) { /* private mode */ } render(); });
+try { if (localStorage.getItem('onlyChanges') === '0') $('onlyChk').checked = false; } catch (e) { /* private mode */ }
 $('movieFoldersChk').addEventListener('change', (e) => run(async () => {
   await saveSettings({ MovieFolders: e.target.checked });
   if (state.plans.Movie.length) { setBusy(false); await analyze(); }
