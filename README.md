@@ -15,7 +15,7 @@ If you'd rather not run an unsigned exe, download the zip and double-click **`Ep
 
 ```powershell
 Install-Module ps2exe -Scope CurrentUser
-.\build.ps1 -Version 1.0.0
+powershell -ExecutionPolicy Bypass -File .\build.ps1 -Version 1.0.0
 ```
 This writes `dist\EpisodeRenamer.exe` and `dist\EpisodeRenamer-1.0.0.zip`.
 
