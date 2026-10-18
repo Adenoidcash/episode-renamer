@@ -2,7 +2,10 @@
 # Keep this file ASCII-only (Windows PowerShell 5.1 reads BOM-less files as ANSI).
 
 $ErrorActionPreference = 'Stop'
+$fnBefore = @(Get-ChildItem function: | ForEach-Object { $_.Name })
 . (Join-Path $PSScriptRoot 'EpisodeRenamer.Core.ps1')
+# Every core function gets copied into the background runspace (see Start-Background).
+$script:CoreFunctionNames = @(Get-ChildItem function: | ForEach-Object { $_.Name } | Where-Object { $fnBefore -notcontains $_ })
 
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 try {
@@ -17,9 +20,11 @@ $script:SearchResults = @()
 $script:SelectedShow = $null
 $script:Loading = $true
 $script:Jobs = New-Object System.Collections.ArrayList
+$script:Sync = [hashtable]::Synchronized(@{ Status = '' })
 $script:AfterFetch = $null
 $script:YearHint = $null
 $script:UpdateUrl = $null
+$script:LibTabs = @{}
 
 $MatchModes = [ordered]@{ 'Auto' = 'Auto'; 'Season + Episode' = 'SeasonEpisode'; 'Absolute number' = 'Absolute' }
 $NumberingModes = [ordered]@{ 'Auto' = 'Auto'; 'From source' = 'Source'; 'From file / folder' = 'File' }
@@ -55,111 +60,227 @@ function New-Combo([int]$Width, [string[]]$Items) {
     foreach ($i in $Items) { [void]$c.Items.Add($i) }
     $c
 }
+function New-CheckBox([string]$Text) {
+    $c = New-Object Windows.Forms.CheckBox
+    $c.Text = $Text; $c.AutoSize = $true; $c.Margin = New-Pad 10 7 3 3
+    $c
+}
 function New-Row {
     $p = New-Object Windows.Forms.FlowLayoutPanel
     $p.AutoSize = $true; $p.Dock = 'Fill'; $p.WrapContents = $true; $p.Margin = New-Pad 0 0 0 0
     $p
 }
+function New-Stack {
+    $t = New-Object Windows.Forms.TableLayoutPanel
+    $t.Dock = 'Fill'; $t.ColumnCount = 1
+    $t
+}
+function Add-StackRow($Stack, $Control, [switch]$Fill) {
+    $style = if ($Fill) { New-Object Windows.Forms.RowStyle('Percent', 100) } else { New-Object Windows.Forms.RowStyle('AutoSize') }
+    [void]$Stack.RowStyles.Add($style)
+    $Stack.Controls.Add($Control)
+}
+function New-Grid([object[]]$Columns) {
+    $g = New-Object Windows.Forms.DataGridView
+    $g.Dock = 'Fill'
+    $g.AllowUserToAddRows = $false; $g.AllowUserToDeleteRows = $false; $g.AllowUserToResizeRows = $false
+    $g.RowHeadersVisible = $false
+    $g.SelectionMode = 'FullRowSelect'
+    $g.AutoSizeColumnsMode = 'Fill'
+    $g.BackgroundColor = [Drawing.SystemColors]::Window
+    $g.BorderStyle = 'Fixed3D'
+    $use = New-Object Windows.Forms.DataGridViewCheckBoxColumn
+    $use.HeaderText = 'Use'; $use.FillWeight = 5
+    [void]$g.Columns.Add($use)
+    foreach ($c in $Columns) {
+        $col = New-Object Windows.Forms.DataGridViewTextBoxColumn
+        $col.HeaderText = $c[0]; $col.FillWeight = $c[1]; $col.ReadOnly = $true
+        [void]$g.Columns.Add($col)
+    }
+    $g.Add_CurrentCellDirtyStateChanged({ if ($this.IsCurrentCellDirty) { $this.CommitEdit('CurrentCellChange') } })
+    $g
+}
 
-# ---------------------------------------------------------------- form
+function Set-StatusColor($Cell, [string]$Status) {
+    $Cell.Style.ForeColor = switch -Wildcard ($Status) {
+        'Ready*'      { [Drawing.Color]::DarkGreen }
+        'Renamed*'    { [Drawing.Color]::DarkGreen }
+        'Rename folder' { [Drawing.Color]::DarkGreen }
+        'Unchanged'   { [Drawing.Color]::Gray }
+        'Up to date*' { [Drawing.Color]::Gray }
+        ''            { [Drawing.Color]::Gray }
+        default       { [Drawing.Color]::Firebrick }
+    }
+}
+
+# ---------------------------------------------------------------- form + shared options
 
 $form = New-Object Windows.Forms.Form
 $form.Text = "Episode Renamer $script:AppVersion"
 $form.Font = New-Object Drawing.Font('Segoe UI', 9)
 $form.AutoScaleMode = 'Dpi'
-$form.ClientSize = New-Object Drawing.Size(1180, 680)
-$form.MinimumSize = New-Object Drawing.Size(900, 500)
+$form.ClientSize = New-Object Drawing.Size(1180, 720)
+$form.MinimumSize = New-Object Drawing.Size(900, 520)
 $form.StartPosition = 'CenterScreen'
 $form.AllowDrop = $true
+$script:BoldFont = New-Object Drawing.Font($form.Font, [Drawing.FontStyle]::Bold)
 
-$layout = New-Object Windows.Forms.TableLayoutPanel
-$layout.Dock = 'Fill'; $layout.ColumnCount = 1; $layout.Padding = New-Pad 6 6 6 6
-$form.Controls.Add($layout)
+$main = New-Stack
+$main.Padding = New-Pad 6 6 6 6
+$form.Controls.Add($main)
 
-# Row 1: folder
-$row1 = New-Row
-$txtFolder = New-TextBox 560
-$btnBrowse = New-Button 'Browse...'
-$btnAddFiles = New-Button 'Add files...'
-$chkRecurse = New-Object Windows.Forms.CheckBox
-$chkRecurse.Text = 'Include subfolders'; $chkRecurse.AutoSize = $true; $chkRecurse.Margin = New-Pad 8 7 3 3
-$btnScan = New-Button 'Scan'
-$row1.Controls.AddRange(@((New-Label 'Folder:'), $txtFolder, $btnBrowse, $btnAddFiles, $chkRecurse, $btnScan))
-
-# Row 2: lookup source
-$row2 = New-Row
+# Shared: where data comes from and how names are built (used by Episodes and TV Library).
+$rowSource = New-Row
 $cboSource = New-Combo 120 @('TVmaze', 'TheTVDB')
 $cboOrder = New-Combo 100 @('Aired', 'DVD', 'Absolute')
 $txtLang = New-TextBox 50
 $btnSettings = New-Button 'Settings...'
-$row2.Controls.AddRange(@((New-Label 'Source:'), $cboSource, (New-Label 'Episode order:'), $cboOrder,
+$rowSource.Controls.AddRange(@((New-Label 'TV source:'), $cboSource, (New-Label 'Episode order:'), $cboOrder,
         (New-Label 'Language (TVDB):'), $txtLang, $btnSettings))
 
-# Row 2b: how files map to episodes
-$row2b = New-Row
+$rowMatch = New-Row
 $cboMatch = New-Combo 130 @($MatchModes.Keys)
 $cboNumbering = New-Combo 130 @($NumberingModes.Keys)
 $cboTitles = New-Combo 140 @($TitleModes.Keys)
-$chkExtras = New-Object Windows.Forms.CheckBox
-$chkExtras.Text = 'Rename matching extras (.nfo, -thumb.jpg, .srt)'; $chkExtras.AutoSize = $true; $chkExtras.Margin = New-Pad 12 7 3 3
-$row2b.Controls.AddRange(@((New-Label 'Match files by:'), $cboMatch, (New-Label 'Numbering:'), $cboNumbering,
+$chkExtras = New-CheckBox 'Rename matching extras (.nfo, -thumb.jpg, .srt)'
+$rowMatch.Controls.AddRange(@((New-Label 'Match files by:'), $cboMatch, (New-Label 'Numbering:'), $cboNumbering,
         (New-Label 'Titles:'), $cboTitles, $chkExtras))
 
-# Row 3: show search
-$row3 = New-Row
-$txtSearch = New-TextBox 240
-$btnSearch = New-Button 'Search'
-$cboResults = New-Combo 430 @()
-$txtShowName = New-TextBox 200
-$row3.Controls.AddRange(@((New-Label 'Show:'), $txtSearch, $btnSearch, $cboResults, (New-Label 'Name in file:'), $txtShowName))
-
-# Row 4: scheme
-$row4 = New-Row
-$txtScheme = New-TextBox 460
+$rowScheme = New-Row
+$txtScheme = New-TextBox 420
 $btnResetScheme = New-Button 'Reset'
-$lblTokens = New-Label 'Tokens: {show} {season:00} {episode:00} {title} {absolute:000} {year} {airdate}   Use \ for folders, e.g. Season {season:00}\...'
+$lblTokens = New-Label 'Tokens: {show} {season:00} {episode:00} {title} {absolute:000} {year} {airdate}'
 $lblTokens.ForeColor = [Drawing.Color]::DimGray
-$row4.Controls.AddRange(@((New-Label 'Name scheme:'), $txtScheme, $btnResetScheme, $lblTokens))
+$rowScheme.Controls.AddRange(@((New-Label 'Episode name scheme:'), $txtScheme, $btnResetScheme, $lblTokens))
 
-# Grid
-$grid = New-Object Windows.Forms.DataGridView
-$grid.Dock = 'Fill'
-$grid.AllowUserToAddRows = $false
-$grid.AllowUserToDeleteRows = $false
-$grid.AllowUserToResizeRows = $false
-$grid.RowHeadersVisible = $false
-$grid.SelectionMode = 'FullRowSelect'
-$grid.AutoSizeColumnsMode = 'Fill'
-$grid.BackgroundColor = [Drawing.SystemColors]::Window
-$grid.BorderStyle = 'Fixed3D'
-$colUse = New-Object Windows.Forms.DataGridViewCheckBoxColumn
-$colUse.HeaderText = 'Use'; $colUse.FillWeight = 5
-[void]$grid.Columns.Add($colUse)
-foreach ($c in @(@('Original name', 40), @('Detected', 9), @('New name', 46), @('Status', 14))) {
-    $col = New-Object Windows.Forms.DataGridViewTextBoxColumn
-    $col.HeaderText = $c[0]; $col.FillWeight = $c[1]; $col.ReadOnly = $true
-    [void]$grid.Columns.Add($col)
-}
+$tabs = New-Object Windows.Forms.TabControl
+$tabs.Dock = 'Fill'
+$tabs.Margin = New-Pad 0 6 0 0
 
-# Bottom bar
-$row5 = New-Row
-$btnPreview = New-Button 'Refresh preview'
-$btnRename = New-Button 'Rename checked'
-$btnRename.Font = New-Object Drawing.Font($form.Font, [Drawing.FontStyle]::Bold)
+# Shared status bar.
+$rowStatus = New-Row
 $btnUndo = New-Button 'Undo last rename'
-$btnAll = New-Button 'Check all'
-$btnNone = New-Button 'Check none'
-$btnRemove = New-Button 'Remove selected'
 $progress = New-Object Windows.Forms.ProgressBar
 $progress.Style = 'Marquee'; $progress.Width = 110; $progress.Height = 16; $progress.Margin = New-Pad 10 9 3 3; $progress.Visible = $false
 $lblStatus = New-Label ''
 $lnkUpdate = New-Object Windows.Forms.LinkLabel
 $lnkUpdate.AutoSize = $true; $lnkUpdate.Margin = New-Pad 16 8 3 0; $lnkUpdate.Visible = $false
-$row5.Controls.AddRange(@($btnPreview, $btnRename, $btnUndo, $btnAll, $btnNone, $btnRemove, $progress, $lblStatus, $lnkUpdate))
+$rowStatus.Controls.AddRange(@($btnUndo, $progress, $lblStatus, $lnkUpdate))
 
-foreach ($r in @($row1, $row2, $row2b, $row3, $row4)) { [void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize'))); $layout.Controls.Add($r) }
-[void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('Percent', 100))); $layout.Controls.Add($grid)
-[void]$layout.RowStyles.Add((New-Object Windows.Forms.RowStyle('AutoSize'))); $layout.Controls.Add($row5)
+Add-StackRow $main $rowSource
+Add-StackRow $main $rowMatch
+Add-StackRow $main $rowScheme
+Add-StackRow $main $tabs -Fill
+Add-StackRow $main $rowStatus
+
+# ---------------------------------------------------------------- Episodes tab
+
+$pageEp = New-Object Windows.Forms.TabPage
+$pageEp.Text = 'Episodes'; $pageEp.Padding = New-Pad 4 4 4 4
+$stackEp = New-Stack
+$pageEp.Controls.Add($stackEp)
+
+$rowFolder = New-Row
+$txtFolder = New-TextBox 560
+$btnBrowse = New-Button 'Browse...'
+$btnAddFiles = New-Button 'Add files...'
+$chkRecurse = New-CheckBox 'Include subfolders'
+$btnScan = New-Button 'Scan'
+$rowFolder.Controls.AddRange(@((New-Label 'Folder:'), $txtFolder, $btnBrowse, $btnAddFiles, $chkRecurse, $btnScan))
+
+$rowShow = New-Row
+$txtSearch = New-TextBox 240
+$btnSearch = New-Button 'Search'
+$cboResults = New-Combo 430 @()
+$txtShowName = New-TextBox 200
+$rowShow.Controls.AddRange(@((New-Label 'Show:'), $txtSearch, $btnSearch, $cboResults, (New-Label 'Name in file:'), $txtShowName))
+
+$grid = New-Grid @(@('Original name', 40), @('Detected', 9), @('New name', 46), @('Status', 14))
+
+$rowEpButtons = New-Row
+$btnPreview = New-Button 'Refresh preview'
+$btnRename = New-Button 'Rename checked'
+$btnRename.Font = $script:BoldFont
+$btnAll = New-Button 'Check all'
+$btnNone = New-Button 'Check none'
+$btnRemove = New-Button 'Remove selected'
+$rowEpButtons.Controls.AddRange(@($btnPreview, $btnRename, $btnAll, $btnNone, $btnRemove))
+
+Add-StackRow $stackEp $rowFolder
+Add-StackRow $stackEp $rowShow
+Add-StackRow $stackEp $grid -Fill
+Add-StackRow $stackEp $rowEpButtons
+$tabs.TabPages.Add($pageEp)
+
+# ---------------------------------------------------------------- library tabs (TV Library, Movies)
+
+function New-LibraryTab([string]$Kind, [string]$Title, [string]$Hint) {
+    $page = New-Object Windows.Forms.TabPage
+    $page.Text = $Title; $page.Padding = New-Pad 4 4 4 4
+    $stack = New-Stack
+    $page.Controls.Add($stack)
+
+    $rowF = New-Row
+    $txt = New-TextBox 560
+    $btnB = New-Button 'Browse...'; $btnB.Tag = $Kind
+    $btnA = New-Button 'Analyze'; $btnA.Tag = $Kind; $btnA.Font = $script:BoldFont
+    $rowF.Controls.AddRange(@((New-Label 'Folder:'), $txt, $btnB, $btnA))
+    $lblHint = New-Label $Hint
+    $lblHint.ForeColor = [Drawing.Color]::DimGray
+    $lblHint.Margin = New-Pad 6 2 3 4
+
+    $g = New-Grid @(@('Current name', 34), @('New name', 34), @('Matched as', 17), @('Status', 17))
+    $g.Tag = $Kind
+
+    $rowB = New-Row
+    $btnRen = New-Button 'Rename checked'; $btnRen.Tag = $Kind; $btnRen.Font = $script:BoldFont
+    $btnMatch = New-Button 'Change match...'; $btnMatch.Tag = $Kind
+    $btnAll = New-Button 'Check all'; $btnAll.Tag = $Kind
+    $btnNone = New-Button 'Check none'; $btnNone.Tag = $Kind
+    $chkDetails = New-CheckBox 'Show file details'; $chkDetails.Tag = $Kind; $chkDetails.Checked = $true
+    $rowB.Controls.AddRange(@($btnRen, $btnMatch, $btnAll, $btnNone, $chkDetails))
+    $chkFolders = $null
+    if ($Kind -eq 'Movie') {
+        $chkFolders = New-CheckBox 'Put loose movies in their own folder'; $chkFolders.Tag = $Kind
+        $rowB.Controls.Add($chkFolders)
+    }
+
+    Add-StackRow $stack $rowF
+    Add-StackRow $stack $lblHint
+    Add-StackRow $stack $g -Fill
+    Add-StackRow $stack $rowB
+
+    $btnB.Add_Click({
+            $st = $script:LibTabs[$this.Tag]
+            $d = New-Object Windows.Forms.FolderBrowserDialog
+            $d.Description = 'Pick the folder to analyze'
+            if ($st.Txt.Text -and (Test-Path -LiteralPath $st.Txt.Text)) { $d.SelectedPath = $st.Txt.Text }
+            if ($d.ShowDialog($form) -eq 'OK') { $st.Txt.Text = $d.SelectedPath; Invoke-Safe { Start-Analyze $st } }
+        })
+    $btnA.Add_Click({ $st = $script:LibTabs[$this.Tag]; Invoke-Safe { Start-Analyze $st } })
+    $btnRen.Add_Click({ $st = $script:LibTabs[$this.Tag]; Invoke-Safe { Invoke-LibraryRename $st } })
+    $btnMatch.Add_Click({ $st = $script:LibTabs[$this.Tag]; Invoke-Safe { Show-ChangeMatch $st } })
+    $btnAll.Add_Click({ foreach ($r in $script:LibTabs[$this.Tag].Grid.Rows) { if ($r.Tag.Parent -and $r.Tag.Plan.Ops.Count) { $r.Cells[0].Value = $true } } })
+    $btnNone.Add_Click({ foreach ($r in $script:LibTabs[$this.Tag].Grid.Rows) { if ($r.Tag.Parent) { $r.Cells[0].Value = $false } } })
+    $chkDetails.Add_CheckedChanged({
+            $gr = $script:LibTabs[$this.Tag].Grid
+            $gr.CurrentCell = $null
+            foreach ($r in $gr.Rows) { if (-not $r.Tag.Parent) { $r.Visible = $this.Checked } }
+        })
+    $g.Add_CellDoubleClick({ if ($_.RowIndex -ge 0) { $st = $script:LibTabs[$this.Tag]; Invoke-Safe { Show-ChangeMatch $st } } })
+    if ($chkFolders) {
+        $chkFolders.Add_CheckedChanged({
+                $st = $script:LibTabs[$this.Tag]
+                if (-not $script:Loading -and @($st.Plans).Count) { Invoke-Safe { Start-Analyze $st } }
+            })
+    }
+
+    $tabs.TabPages.Add($page)
+    [pscustomobject]@{ Kind = $Kind; Page = $page; Txt = $txt; Grid = $g; Plans = @(); Details = $chkDetails; MovieFolders = $chkFolders }
+}
+
+$script:LibTabs['TV'] = New-LibraryTab 'TV' 'TV Library' 'Pick one show folder or a whole TV library. Show folders become "Show (Year)", season folders "Season 01", and episodes follow the name scheme above.'
+$script:LibTabs['Movie'] = New-LibraryTab 'Movie' 'Movies' 'Pick a movies folder (or one movie''s folder). Movies become "Title (Year)\Title (Year).mkv". Add a free TMDB key in Settings for exact titles; otherwise the title and year come from the filename.'
 
 $tips = New-Object Windows.Forms.ToolTip
 $tips.SetToolTip($cboOrder, 'Aired = normal TV order. DVD/Absolute only differ on TheTVDB (TVmaze: Absolute = S01E<absolute>).')
@@ -181,14 +302,25 @@ function Invoke-Safe([scriptblock]$Action) {
 
 function Set-Status([string]$Text) { $lblStatus.Text = $Text }
 
+function Confirm-Action([string]$Message) {
+    [Windows.Forms.MessageBox]::Show($form, $Message, 'Episode Renamer', 'YesNo', 'Question') -eq 'Yes'
+}
+
+function Get-LookupContext {
+    @{
+        Source = [string]$cboSource.SelectedItem; Order = [string]$cboOrder.SelectedItem; Lang = $txtLang.Text.Trim()
+        Match = $MatchModes[[string]$cboMatch.SelectedItem]; Numbering = $NumberingModes[[string]$cboNumbering.SelectedItem]
+        TitleMode = $TitleModes[[string]$cboTitles.SelectedItem]; Scheme = $txtScheme.Text; Extras = $chkExtras.Checked
+        MovieFolders = $script:LibTabs['Movie'].MovieFolders.Checked
+        TvdbKey = $settings.TvdbApiKey; TvdbPin = $settings.TvdbPin; TmdbKey = $settings.TmdbKey
+    }
+}
+
 # ---------------------------------------------------------------- background work
 # Network calls run in a separate runspace so the window keeps painting; a timer picks up the result
 # and runs the completion block on the UI thread. Only one visible (non-quiet) job runs at a time.
 
-$script:BgFunctionNames = @('Invoke-Json', 'Search-TVmaze', 'Get-TVmazeEpisodes', 'Complete-AbsoluteNumbers',
-    'Connect-Tvdb', 'Get-TvdbHeaders', 'Search-Tvdb', 'Get-TvdbEpisodes')
-$script:BgPrelude = "[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12`n" +
-    (($script:BgFunctionNames | ForEach-Object { "function $_ {`n$((Get-Item "function:$_").Definition)`n}" }) -join "`n")
+$script:BgPrelude = (($script:CoreFunctionNames | ForEach-Object { "function $_ {`n$((Get-Item "function:$_").Definition)`n}" }) -join "`n") + "`nInitialize-Core`n"
 
 $jobTimer = New-Object Windows.Forms.Timer
 $jobTimer.Interval = 100
@@ -196,13 +328,13 @@ $jobTimer.Interval = 100
 function Test-Busy { @($script:Jobs | Where-Object { -not $_.Quiet }).Count -gt 0 }
 
 function Set-Busy([bool]$On) {
-    foreach ($c in @($row1, $row2, $row2b, $row3, $row4, $btnPreview, $btnRename, $btnUndo, $btnRemove)) { $c.Enabled = -not $On }
+    foreach ($c in @($rowSource, $rowMatch, $rowScheme, $tabs, $btnUndo)) { $c.Enabled = -not $On }
     $progress.Visible = $On
     $form.UseWaitCursor = $On
 }
 
-# $Work runs in the background runspace (only the functions in BgFunctionNames exist there) and must
-# return everything $OnDone needs; $OnDone gets that value on the UI thread.
+# $Work runs in the background runspace (only core functions exist there) and must return everything
+# $OnDone needs; $OnDone gets that value on the UI thread.
 function Start-Background([string]$Status, [scriptblock]$Work, [hashtable]$Params, [scriptblock]$OnDone, [switch]$Quiet) {
     if (-not $Quiet -and (Test-Busy)) { return $false }
     $ps = [powershell]::Create()
@@ -211,12 +343,13 @@ function Start-Background([string]$Status, [scriptblock]$Work, [hashtable]$Param
     [void]$ps.AddScript($Work.ToString(), $false)
     foreach ($k in $Params.Keys) { [void]$ps.AddParameter($k, $Params[$k]) }
     [void]$script:Jobs.Add(@{ PS = $ps; Handle = $ps.BeginInvoke(); OnDone = $OnDone; Quiet = [bool]$Quiet })
-    if (-not $Quiet) { Set-Busy $true; Set-Status $Status }
+    if (-not $Quiet) { $script:Sync.Status = ''; Set-Busy $true; Set-Status $Status }
     $jobTimer.Start()
     $true
 }
 
 $jobTimer.Add_Tick({
+        if ((Test-Busy) -and $script:Sync.Status -and $lblStatus.Text -ne $script:Sync.Status) { $lblStatus.Text = $script:Sync.Status }
         foreach ($j in @($script:Jobs | Where-Object { $_.Handle.IsCompleted })) {
             $script:Jobs.Remove($j)
             $out = $null; $err = $null
@@ -241,7 +374,7 @@ $jobTimer.Add_Tick({
         if ($script:Jobs.Count -eq 0) { $jobTimer.Stop() }
     })
 
-# ---------------------------------------------------------------- file list
+# ---------------------------------------------------------------- Episodes: file list
 
 function Get-RelativeDisplay($Item) {
     $root = $Item.Root.TrimEnd('\') + '\'
@@ -323,7 +456,7 @@ function Invoke-Scan {
     if (-not (Test-Busy)) { Set-Status "$($grid.Rows.Count) file(s) found." }
 }
 
-# ---------------------------------------------------------------- lookup
+# ---------------------------------------------------------------- Episodes: lookup
 
 function Invoke-Search {
     $q = $txtSearch.Text.Trim()
@@ -386,20 +519,13 @@ function Request-Episodes {
         })
 }
 
-# ---------------------------------------------------------------- preview + rename
+# ---------------------------------------------------------------- Episodes: preview + rename
 
 function Set-RowState($Row, [string]$NewName, [string]$Status) {
     $Row.Tag.Status = $Status
     $Row.Cells[3].Value = $NewName
     $Row.Cells[4].Value = $Status
-    $color = switch -Wildcard ($Status) {
-        'Ready'     { [Drawing.Color]::DarkGreen }
-        'Renamed*'  { [Drawing.Color]::DarkGreen }
-        'Unchanged' { [Drawing.Color]::Gray }
-        ''          { [Drawing.Color]::Gray }
-        default     { [Drawing.Color]::Firebrick }
-    }
-    $Row.Cells[4].Style.ForeColor = $color
+    Set-StatusColor $Row.Cells[4] $Status
 }
 
 function Test-TargetTaken([string]$Target, [string]$Source) {
@@ -464,7 +590,7 @@ function Invoke-Rename {
     $extraCount = ($rows | ForEach-Object { $_.Tag.Companions.Count } | Measure-Object -Sum).Sum
     $msg = "Rename $($rows.Count) file(s)?"
     if ($extraCount) { $msg = "Rename $($rows.Count) file(s) plus $extraCount matching extra file(s)?" }
-    if ([Windows.Forms.MessageBox]::Show($form, $msg, 'Episode Renamer', 'YesNo', 'Question') -ne 'Yes') { return }
+    if (-not (Confirm-Action $msg)) { return }
 
     $plan = foreach ($row in $rows) {
         [pscustomobject]@{ Source = $row.Tag.FullPath; Target = $row.Tag.Target; Row = $row; Companion = $null }
@@ -497,14 +623,195 @@ function Invoke-Rename {
     }
 }
 
+# ---------------------------------------------------------------- library tabs: analyze, show, rename, re-match
+
+function Start-Analyze($St) {
+    $root = $St.Txt.Text.Trim().TrimEnd('\')
+    if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { throw 'Pick a folder that exists first.' }
+    $St.Txt.Text = $root
+    $params = @{ Root = $root; Ctx = (Get-LookupContext); Kind = $St.Kind; Sync = $script:Sync; Token = $script:TvdbToken }
+    [void](Start-Background "Scanning $root..." {
+            param($Root, $Ctx, $Kind, $Sync, $Token)
+            $script:TvdbToken = $Token
+            $plans = New-Object System.Collections.Generic.List[object]
+            if ($Kind -eq 'TV') {
+                $dirs = @(Get-TvShowFolders $Root)
+                for ($i = 0; $i -lt $dirs.Count; $i++) {
+                    $Sync.Status = "Looking up $(Split-Path $dirs[$i] -Leaf) ($($i + 1) of $($dirs.Count))..."
+                    $plans.Add((Get-ShowPlan $dirs[$i] $Ctx $null))
+                }
+            } else {
+                $items = @(Get-MovieItems $Root)
+                for ($i = 0; $i -lt $items.Count; $i++) {
+                    $Sync.Status = "Checking $(Split-Path $items[$i].Path -Leaf) ($($i + 1) of $($items.Count))..."
+                    $plans.Add((Get-MoviePlan $items[$i] $Ctx $null))
+                }
+            }
+            @{ Plans = $plans.ToArray(); Kind = $Kind; Token = $script:TvdbToken }
+        } $params {
+            param($o)
+            $script:TvdbToken = $o.Token
+            $st = $script:LibTabs[$o.Kind]
+            $st.Plans = @($o.Plans)
+            Show-LibraryPlans $st
+        })
+}
+
+function Get-MatchText($Plan) {
+    $m = $Plan.Match
+    if (-not $m) { return '' }
+    $year = if ($m.Year) { " ($($m.Year))" } else { '' }
+    $src = if ($m.Source -eq 'Filename') { 'from filename' } else { $m.Source }
+    "$($m.Name)$year  [$src]"
+}
+
+function Show-LibraryPlans($St) {
+    $g = $St.Grid
+    $g.Rows.Clear()
+    $plans = @($St.Plans)
+    for ($i = 0; $i -lt $plans.Count; $i++) {
+        $p = $plans[$i]
+        $canRun = @($p.Ops).Count -gt 0 -and $p.Status -notlike 'Error*'
+        $idx = $g.Rows.Add($canRun, $p.Label, $p.NewName, (Get-MatchText $p), $p.Status)
+        $row = $g.Rows[$idx]
+        $row.Tag = @{ Plan = $p; Index = $i; Parent = $true }
+        $row.DefaultCellStyle.Font = $script:BoldFont
+        $row.Cells[1].ToolTipText = $p.Dir
+        Set-StatusColor $row.Cells[4] $p.Status
+        foreach ($r in @($p.Rows)) {
+            $idx = $g.Rows.Add($null, ('      ' + $r.Current), ('      ' + $r.New), '', $r.Status)
+            $child = $g.Rows[$idx]
+            $child.Cells[0] = New-Object Windows.Forms.DataGridViewTextBoxCell
+            $child.Cells[0].ReadOnly = $true
+            $child.Tag = @{ Plan = $p; Index = $i; Parent = $false }
+            $child.DefaultCellStyle.ForeColor = [Drawing.Color]::DimGray
+            Set-StatusColor $child.Cells[4] $r.Status
+            $child.Visible = $St.Details.Checked
+        }
+    }
+    $what = if ($St.Kind -eq 'TV') { 'show(s)' } else { 'movie(s)' }
+    $ready = @($plans | Where-Object { @($_.Ops).Count -gt 0 -and $_.Status -notlike 'Error*' }).Count
+    Set-Status "$($plans.Count) $what found, $ready with changes to make."
+}
+
+function Invoke-LibraryRename($St) {
+    $rows = @($St.Grid.Rows | Where-Object { $_.Tag.Parent -and $_.Cells[0].Value -and @($_.Tag.Plan.Ops).Count -gt 0 })
+    if ($rows.Count -eq 0) { throw 'Nothing is checked that has changes to make.' }
+    $opCount = ($rows | ForEach-Object { @($_.Tag.Plan.Ops | Where-Object { $_.Op -ne 'RmDirIfEmpty' }).Count } | Measure-Object -Sum).Sum
+    $what = if ($St.Kind -eq 'TV') { 'show(s)' } else { 'movie(s)' }
+    if (-not (Confirm-Action "Apply $opCount rename(s) across $($rows.Count) $what?`n`nYou can put everything back with ""Undo last rename"".")) { return }
+    $results = Invoke-LibraryPlans @($rows | ForEach-Object { $_.Tag.Plan })
+    $ok = 0
+    foreach ($r in $results) {
+        $row = $rows | Where-Object { $_.Tag.Plan -eq $r.Plan } | Select-Object -First 1
+        $row.Cells[0].Value = $false
+        if ($r.Error) {
+            $row.Cells[4].Value = "Stopped after $($r.Done) of $(@($r.Plan.Ops).Count): $($r.Error)"
+        } else {
+            $ok++
+            $row.Cells[4].Value = 'Renamed'
+        }
+        Set-StatusColor $row.Cells[4] $row.Cells[4].Value
+    }
+    Set-Status "Done: $ok of $($rows.Count) $what renamed. Click Analyze to see the result."
+}
+
+function Show-ChangeMatch($St) {
+    $row = $St.Grid.CurrentRow
+    if (-not $row -or -not $row.Tag) { throw 'Select a show or movie in the list first.' }
+    $plan = $row.Tag.Plan
+    $isTv = $St.Kind -eq 'TV'
+    $script:DlgResults = @($plan.Results)
+
+    $dlg = New-Object Windows.Forms.Form
+    $dlg.Text = "Change match - $($plan.Label)"; $dlg.Font = $form.Font; $dlg.AutoScaleMode = 'Dpi'
+    $dlg.FormBorderStyle = 'FixedDialog'; $dlg.MaximizeBox = $false; $dlg.MinimizeBox = $false
+    $dlg.StartPosition = 'CenterParent'; $dlg.AutoSize = $true; $dlg.AutoSizeMode = 'GrowAndShrink'; $dlg.Padding = New-Pad 10 10 10 10
+    $stack = New-Stack
+    $stack.AutoSize = $true
+    $rowQ = New-Row
+    $script:DlgQuery = New-TextBox 300; $script:DlgQuery.Text = $plan.Query
+    $script:DlgYear = New-TextBox 60; $script:DlgYear.Text = "$($plan.Year)"
+    $btnFind = New-Button 'Search'
+    $rowQ.Controls.AddRange(@((New-Label 'Title:'), $script:DlgQuery, (New-Label 'Year:'), $script:DlgYear, $btnFind))
+    $script:DlgList = New-Object Windows.Forms.ListBox
+    $script:DlgList.Width = 620; $script:DlgList.Height = 240; $script:DlgList.Margin = New-Pad 6 6 6 6
+    foreach ($r in $script:DlgResults) { [void]$script:DlgList.Items.Add($r.Display) }
+    if ($script:DlgList.Items.Count) { $script:DlgList.SelectedIndex = [Math]::Max(0, [array]::IndexOf([object[]]$script:DlgResults, $plan.Match)) }
+    $rowBtn = New-Row
+    $ok = New-Button 'Use selected'; $ok.DialogResult = 'OK'
+    $typed = New-Button 'Use title and year as typed'; $typed.DialogResult = 'Yes'
+    $cancel = New-Button 'Cancel'; $cancel.DialogResult = 'Cancel'
+    $rowBtn.Controls.Add($ok)
+    if (-not $isTv) { $rowBtn.Controls.Add($typed) }
+    $rowBtn.Controls.Add($cancel)
+    Add-StackRow $stack $rowQ
+    Add-StackRow $stack $script:DlgList
+    Add-StackRow $stack $rowBtn
+    $dlg.Controls.Add($stack)
+    $dlg.AcceptButton = $btnFind; $dlg.CancelButton = $cancel
+    $script:DlgKind = $St.Kind
+    $btnFind.Add_Click({
+            Invoke-Safe {
+                $ctx = Get-LookupContext
+                $q = $script:DlgQuery.Text.Trim()
+                $y = if ($script:DlgYear.Text.Trim() -match '^\d{4}$') { [int]$script:DlgYear.Text.Trim() } else { $null }
+                $form.UseWaitCursor = $true
+                try {
+                    if ($script:DlgKind -eq 'TV') { $res = @(Find-Shows $q $ctx) }
+                    elseif ($settings.TmdbKey) { $res = @(Search-Tmdb $q $y $settings.TmdbKey) }
+                    else { throw 'Searching for movies needs a TMDB key (Settings). Without one, type the title and year and click "Use title and year as typed".' }
+                } finally { $form.UseWaitCursor = $false }
+                $script:DlgResults = $res
+                $script:DlgList.Items.Clear()
+                foreach ($r in $res) { [void]$script:DlgList.Items.Add($r.Display) }
+                if ($res.Count) { $script:DlgList.SelectedIndex = 0 } else { throw "Nothing found for '$q'." }
+            }
+        })
+    $script:DlgList.Add_DoubleClick({ if ($script:DlgList.SelectedIndex -ge 0) { $this.FindForm().DialogResult = 'OK' } })
+
+    $answer = $dlg.ShowDialog($form)
+    $forced = $null
+    if ($answer -eq 'OK' -and $script:DlgList.SelectedIndex -ge 0) { $forced = $script:DlgResults[$script:DlgList.SelectedIndex] }
+    elseif ($answer -eq 'Yes' -and $script:DlgQuery.Text.Trim()) {
+        $y = if ($script:DlgYear.Text.Trim() -match '^\d{4}$') { [int]$script:DlgYear.Text.Trim() } else { $null }
+        $forced = [pscustomobject]@{ Source = 'Filename'; Id = $null; Name = $script:DlgQuery.Text.Trim(); Year = $y; Display = $script:DlgQuery.Text.Trim() }
+    }
+    $results = $script:DlgResults
+    $dlg.Dispose()
+    if (-not $forced) { return }
+
+    $params = @{ Kind = $St.Kind; Plan = $plan; Ctx = (Get-LookupContext); Forced = $forced; Token = $script:TvdbToken; Index = $row.Tag.Index; Results = $results }
+    [void](Start-Background "Re-checking $($plan.Label) as $($forced.Name)..." {
+            param($Kind, $Plan, $Ctx, $Forced, $Token, $Index, $Results)
+            $script:TvdbToken = $Token
+            $p = if ($Kind -eq 'TV') { Get-ShowPlan $Plan.Dir $Ctx $Forced } else { Get-MoviePlan $Plan.Item $Ctx $Forced }
+            $p.Results = @($Results)
+            @{ Plan = $p; Index = $Index; Kind = $Kind; Token = $script:TvdbToken }
+        } $params {
+            param($o)
+            $script:TvdbToken = $o.Token
+            $st = $script:LibTabs[$o.Kind]
+            $list = @($st.Plans)
+            $list[$o.Index] = $o.Plan
+            $st.Plans = $list
+            Show-LibraryPlans $st
+        })
+}
+
+# ---------------------------------------------------------------- undo, settings, updates
+
 function Invoke-Undo {
-    $answer = [Windows.Forms.MessageBox]::Show($form, 'Undo the most recent batch of renames?', 'Episode Renamer', 'YesNo', 'Question')
-    if ($answer -ne 'Yes') { return }
+    if (-not (Confirm-Action 'Undo the most recent batch of renames?')) { return }
     $r = Undo-LastRename
-    $msg = "Restored $($r.Restored) file(s)."
+    $msg = "Restored $($r.Restored) file(s) and folder(s)."
     if ($r.Errors.Count) { $msg += "`n`nProblems:`n" + (($r.Errors | Select-Object -First 10) -join "`n") }
     [void][Windows.Forms.MessageBox]::Show($form, $msg, 'Episode Renamer', 'OK', 'Information')
-    if ($txtFolder.Text.Trim() -and (Test-Path -LiteralPath $txtFolder.Text.Trim())) { Invoke-Scan }
+    if ($tabs.SelectedTab -eq $pageEp) {
+        if ($txtFolder.Text.Trim() -and (Test-Path -LiteralPath $txtFolder.Text.Trim())) { Invoke-Scan }
+    } else {
+        foreach ($st in $script:LibTabs.Values) { if ($st.Page -eq $tabs.SelectedTab -and @($st.Plans).Count) { Start-Analyze $st } }
+    }
 }
 
 function Show-SettingsDialog {
@@ -514,16 +821,22 @@ function Show-SettingsDialog {
     $dlg.StartPosition = 'CenterParent'; $dlg.AutoSize = $true; $dlg.AutoSizeMode = 'GrowAndShrink'; $dlg.Padding = New-Pad 10 10 10 10
     $t = New-Object Windows.Forms.TableLayoutPanel
     $t.AutoSize = $true; $t.ColumnCount = 2; $t.Dock = 'Fill'
-    $info = New-Label "TheTVDB needs a free/personal API key. Some keys also need your subscriber PIN.`nTVmaze works without any key."
+    $info = New-Label "All keys are optional. TVmaze (TV) and filename-based movie names work without any."
     $t.Controls.Add($info); $t.SetColumnSpan($info, 2)
-    $txtKey = New-TextBox 340; $txtKey.Text = $settings.TvdbApiKey
-    $txtPin = New-TextBox 340; $txtPin.Text = $settings.TvdbPin
+    $txtKey = New-TextBox 360; $txtKey.Text = $settings.TvdbApiKey
+    $txtPin = New-TextBox 360; $txtPin.Text = $settings.TvdbPin
+    $txtTmdb = New-TextBox 360; $txtTmdb.Text = $settings.TmdbKey
     $t.Controls.Add((New-Label 'TheTVDB API key:')); $t.Controls.Add($txtKey)
-    $t.Controls.Add((New-Label 'Subscriber PIN (optional):')); $t.Controls.Add($txtPin)
+    $t.Controls.Add((New-Label 'TheTVDB subscriber PIN:')); $t.Controls.Add($txtPin)
     $link = New-Object Windows.Forms.LinkLabel
-    $link.Text = 'Get a key: https://thetvdb.com/api-information'; $link.AutoSize = $true; $link.Margin = New-Pad 6 8 3 8
+    $link.Text = 'Get a TheTVDB key: https://thetvdb.com/api-information'; $link.AutoSize = $true; $link.Margin = New-Pad 6 2 3 10
     $link.Add_LinkClicked({ Start-Process 'https://thetvdb.com/api-information' })
     $t.Controls.Add($link); $t.SetColumnSpan($link, 2)
+    $t.Controls.Add((New-Label 'TMDB API key (movies):')); $t.Controls.Add($txtTmdb)
+    $link2 = New-Object Windows.Forms.LinkLabel
+    $link2.Text = 'Get a free TMDB key: https://www.themoviedb.org/settings/api'; $link2.AutoSize = $true; $link2.Margin = New-Pad 6 2 3 10
+    $link2.Add_LinkClicked({ Start-Process 'https://www.themoviedb.org/settings/api' })
+    $t.Controls.Add($link2); $t.SetColumnSpan($link2, 2)
     $btns = New-Row
     $ok = New-Button 'Save'; $ok.DialogResult = 'OK'
     $cancel = New-Button 'Cancel'; $cancel.DialogResult = 'Cancel'
@@ -534,6 +847,7 @@ function Show-SettingsDialog {
     if ($dlg.ShowDialog($form) -eq 'OK') {
         $settings.TvdbApiKey = $txtKey.Text.Trim()
         $settings.TvdbPin = $txtPin.Text.Trim()
+        $settings.TmdbKey = $txtTmdb.Text.Trim()
         $script:TvdbToken = $null
         Save-Settings $settings
     }
@@ -577,6 +891,13 @@ $form.Add_DragEnter({ if ($_.Data.GetDataPresent([Windows.Forms.DataFormats]::Fi
 $form.Add_DragDrop({
         $paths = @($_.Data.GetData([Windows.Forms.DataFormats]::FileDrop))
         Invoke-Safe {
+            # On a library tab, a dropped folder becomes that tab's folder.
+            foreach ($st in $script:LibTabs.Values) {
+                if ($st.Page -eq $tabs.SelectedTab) {
+                    if ($paths.Count -eq 1 -and (Test-Path -LiteralPath $paths[0] -PathType Container)) { $st.Txt.Text = $paths[0]; Start-Analyze $st }
+                    return
+                }
+            }
             if ($paths.Count -eq 1 -and (Test-Path -LiteralPath $paths[0] -PathType Container)) {
                 $txtFolder.Text = $paths[0]; $txtSearch.Text = ''; Invoke-Scan
             } else {
@@ -592,7 +913,7 @@ $cboSource.Add_SelectedIndexChanged({
         if ($script:Loading) { return }
         $cboResults.Items.Clear(); $script:SearchResults = @(); $script:SelectedShow = $null
         Update-Preview
-        if ($txtSearch.Text.Trim()) { Invoke-Safe { Invoke-Search } }
+        if ($tabs.SelectedTab -eq $pageEp -and $txtSearch.Text.Trim()) { Invoke-Safe { Invoke-Search } }
     })
 $cboResults.Add_SelectedIndexChanged({
         $i = $cboResults.SelectedIndex
@@ -615,7 +936,6 @@ $btnResetScheme.Add_Click({ $txtScheme.Text = $script:DefaultScheme })
 $btnSettings.Add_Click({ Show-SettingsDialog })
 $lnkUpdate.Add_LinkClicked({ if ($script:UpdateUrl) { Start-Process $script:UpdateUrl } })
 
-$grid.Add_CurrentCellDirtyStateChanged({ if ($grid.IsCurrentCellDirty) { $grid.CommitEdit('CurrentCellChange') } })
 $grid.Add_CellValueChanged({ if ($_.ColumnIndex -eq 0) { Invoke-Safe { Update-Preview } } })
 
 $btnPreview.Add_Click({ Invoke-Safe { Update-Preview -Fetch } })
@@ -637,6 +957,9 @@ $form.Add_FormClosing({
         $settings.RenameExtras = $chkExtras.Checked
         $settings.Recurse = $chkRecurse.Checked
         $settings.LastFolder = $txtFolder.Text.Trim()
+        $settings.TvRoot = $script:LibTabs['TV'].Txt.Text.Trim()
+        $settings.MovieRoot = $script:LibTabs['Movie'].Txt.Text.Trim()
+        $settings.MovieFolders = $script:LibTabs['Movie'].MovieFolders.Checked
         try { Save-Settings $settings } catch { }
         foreach ($j in @($script:Jobs)) { try { $j.PS.Stop(); $j.PS.Dispose() } catch { } }
     })
@@ -653,7 +976,10 @@ Select-ByValue $cboTitles $TitleModes $settings.TitleMode 'Keep filename title'
 $chkExtras.Checked = [bool]$settings.RenameExtras
 $chkRecurse.Checked = [bool]$settings.Recurse
 $txtFolder.Text = $settings.LastFolder
+$script:LibTabs['TV'].Txt.Text = $settings.TvRoot
+$script:LibTabs['Movie'].Txt.Text = $settings.MovieRoot
+$script:LibTabs['Movie'].MovieFolders.Checked = [bool]$settings.MovieFolders
 $script:Loading = $false
-Set-Status 'Pick a folder (or drag one in), then search for the show.'
+Set-Status 'Pick a folder (or drag one in) to get started.'
 
 [void]$form.ShowDialog()
